@@ -8,6 +8,7 @@ export function formatPersianDateFull(date: Date): string {
     return new Intl.DateTimeFormat("fa-IR", {
       calendar: "persian",
       dateStyle: "full",
+      timeZone: "Asia/Tehran",
     }).format(date);
   } catch (e) {
     return date.toLocaleDateString("fa-IR");
@@ -24,6 +25,7 @@ export function formatPersianDateShort(date: Date): string {
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
+      timeZone: "Asia/Tehran",
     }).format(date);
   } catch (e) {
     return date.toLocaleDateString("fa-IR");
@@ -85,8 +87,7 @@ export function getStableDateKey(date: Date): string {
 
 /**
  * Gets the delivery date for an order received at a specific time.
- * If received today before the cutoff hour, the default target delivery is tomorrow (receivedDate + 1 day).
- * If received today after the cutoff hour, tomorrow's delivery list is already locked, so target delivery is the day after tomorrow (receivedDate + 2 days).
+ * All orders received today are always for tomorrow's delivery.
  */
 export function getDeliveryDateForOrderReceivedAt(
   receivedDate: Date,
@@ -94,15 +95,6 @@ export function getDeliveryDateForOrderReceivedAt(
   cutoffMinute: number = 0
 ): Date {
   const target = new Date(receivedDate);
-  const cutoffTime = new Date(receivedDate);
-  cutoffTime.setHours(cutoffHour, cutoffMinute, 0, 0);
-
-  if (receivedDate >= cutoffTime) {
-    // Past cutoff time, target delivery is the day after tomorrow
-    target.setDate(target.getDate() + 2);
-  } else {
-    // Before cutoff time, target delivery is tomorrow
-    target.setDate(target.getDate() + 1);
-  }
+  target.setDate(target.getDate() + 1);
   return target;
 }

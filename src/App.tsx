@@ -26,7 +26,7 @@ import {
   Calendar,
   Layers
 } from "lucide-react";
-import { Customer, MilkOrder, AppSettings } from "./types";
+import { Customer, MilkOrder, AppSettings, DeliveryRecord } from "./types";
 import { INITIAL_CUSTOMERS, PERS_TEMPLATES, generateMockHistory } from "./data";
 import {
   formatPersianDateFull,
@@ -51,6 +51,11 @@ export default function App() {
     return saved ? JSON.parse(saved) : [];
   });
 
+  const [deliveryRecords, setDeliveryRecords] = useState<DeliveryRecord[]>(() => {
+    const saved = localStorage.getItem("milk_delivery_records");
+    return saved ? JSON.parse(saved) : [];
+  });
+
   const [settings, setSettings] = useState<AppSettings>(() => {
     const saved = localStorage.getItem("milk_settings");
     return saved ? JSON.parse(saved) : { cutoffHour: 20, cutoffMinute: 0 };
@@ -62,7 +67,8 @@ export default function App() {
   const lastServerStateRef = React.useRef({
     customers: "",
     orders: "",
-    settings: ""
+    settings: "",
+    deliveryRecords: ""
   });
 
   // Load from Server on Mount
@@ -84,6 +90,10 @@ export default function App() {
             lastServerStateRef.current.settings = JSON.stringify(data.settings);
             setSettings(data.settings);
           }
+          if (data.deliveryRecords) {
+            lastServerStateRef.current.deliveryRecords = JSON.stringify(data.deliveryRecords);
+            setDeliveryRecords(data.deliveryRecords);
+          }
         }
       } catch (err) {
         console.warn("Could not fetch initial database state from server. Operating in offline/local-first mode:", err);
@@ -98,17 +108,20 @@ export default function App() {
     localStorage.setItem("milk_customers", JSON.stringify(customers));
     localStorage.setItem("milk_orders", JSON.stringify(orders));
     localStorage.setItem("milk_settings", JSON.stringify(settings));
+    localStorage.setItem("milk_delivery_records", JSON.stringify(deliveryRecords));
 
     // 2. Check if local state is actually mutated from what we last loaded/sent
     const currentCustStr = JSON.stringify(customers);
     const currentOrdStr = JSON.stringify(orders);
     const currentSetStr = JSON.stringify(settings);
+    const currentDelStr = JSON.stringify(deliveryRecords);
 
     const isCustChanged = currentCustStr !== lastServerStateRef.current.customers;
     const isOrdChanged = currentOrdStr !== lastServerStateRef.current.orders;
     const isSetChanged = currentSetStr !== lastServerStateRef.current.settings;
+    const isDelChanged = currentDelStr !== lastServerStateRef.current.deliveryRecords;
 
-    if (isCustChanged || isOrdChanged || isSetChanged) {
+    if (isCustChanged || isOrdChanged || isSetChanged || isDelChanged) {
       const timer = setTimeout(async () => {
         try {
           setIsSyncing(true);
@@ -118,13 +131,15 @@ export default function App() {
             body: JSON.stringify({
               customers: isCustChanged ? customers : undefined,
               orders: isOrdChanged ? orders : undefined,
-              settings: isSetChanged ? settings : undefined
+              settings: isSetChanged ? settings : undefined,
+              deliveryRecords: isDelChanged ? deliveryRecords : undefined
             })
           });
           // Update the references to reflect the successfully saved state
           lastServerStateRef.current.customers = currentCustStr;
           lastServerStateRef.current.orders = currentOrdStr;
           lastServerStateRef.current.settings = currentSetStr;
+          lastServerStateRef.current.deliveryRecords = currentDelStr;
         } catch (err) {
           console.warn("Failed to sync local changes with server:", err);
         } finally {
@@ -134,7 +149,7 @@ export default function App() {
 
       return () => clearTimeout(timer);
     }
-  }, [customers, orders, settings]);
+  }, [customers, orders, settings, deliveryRecords]);
 
   // Polling for new background SMS orders every 5 seconds
   useEffect(() => {
@@ -144,11 +159,13 @@ export default function App() {
     const localCustStr = JSON.stringify(customers);
     const localOrdStr = JSON.stringify(orders);
     const localSetStr = JSON.stringify(settings);
+    const localDelStr = JSON.stringify(deliveryRecords);
 
     const hasUnsavedChanges =
       localCustStr !== lastServerStateRef.current.customers ||
       localOrdStr !== lastServerStateRef.current.orders ||
-      localSetStr !== lastServerStateRef.current.settings;
+      localSetStr !== lastServerStateRef.current.settings ||
+      localDelStr !== lastServerStateRef.current.deliveryRecords;
 
     const interval = setInterval(async () => {
       // If we are actively saving or have pending local changes, skip polling to avoid race conditions/overwriting
@@ -164,10 +181,12 @@ export default function App() {
           const serverCustStr = JSON.stringify(data.customers || []);
           const serverOrdStr = JSON.stringify(data.orders || []);
           const serverSetStr = JSON.stringify(data.settings || {});
+          const serverDelStr = JSON.stringify(data.deliveryRecords || []);
 
           const currentCustStr = JSON.stringify(customers);
           const currentOrdStr = JSON.stringify(orders);
           const currentSetStr = JSON.stringify(settings);
+          const currentDelStr = JSON.stringify(deliveryRecords);
 
           // Update only if server differs from our last state, AND we haven't mutated it differently locally
           if (serverCustStr !== lastServerStateRef.current.customers && serverCustStr !== currentCustStr) {
@@ -182,6 +201,10 @@ export default function App() {
             lastServerStateRef.current.settings = serverSetStr;
             setSettings(data.settings);
           }
+          if (serverDelStr !== lastServerStateRef.current.deliveryRecords && serverDelStr !== currentDelStr) {
+            lastServerStateRef.current.deliveryRecords = serverDelStr;
+            setDeliveryRecords(data.deliveryRecords);
+          }
         }
       } catch (err) {
         // Polling failed (e.g. temporary offline/rebuilding state). Quiet log to prevent console spam.
@@ -193,12 +216,9 @@ export default function App() {
       active = false;
       clearInterval(interval);
     };
-  }, [customers, orders, settings, isSyncing]);
+  }, [customers, orders, settings, deliveryRecords, isSyncing]);
 
-  // --- Simulated Clock for Testing ---
-  const [useSimulatedClock, setUseSimulatedClock] = useState<boolean>(false);
-  const [simulatedHour, setSimulatedHour] = useState<number>(19); // 7:00 PM default for testing cutoff
-  const [simulatedMinute, setSimulatedMinute] = useState<number>(30);
+  // --- Real Time Clock ---
   const [realTime, setRealTime] = useState<Date>(new Date());
 
   // Update real clock every second
@@ -209,30 +229,20 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Active Date calculation based on Simulated or Real time
-  const currentAppTime = useMemo(() => {
-    if (!useSimulatedClock) return realTime;
-    const date = new Date(realTime);
-    date.setHours(simulatedHour, simulatedMinute, 0, 0);
-    return date;
-  }, [useSimulatedClock, simulatedHour, simulatedMinute, realTime]);
+  const currentAppTime = realTime;
 
   // --- Active Delivery Date Toggle Mode ---
-  // "auto" (uses cutoff settings) | "today" (shows today's delivery) | "tomorrow" (shows tomorrow's delivery)
-  const [dashboardDateMode, setDashboardDateMode] = useState<"auto" | "today" | "tomorrow">("auto");
+  // "today" (shows today's delivery) | "tomorrow" (shows tomorrow's delivery)
+  const [dashboardDateMode, setDashboardDateMode] = useState<"today" | "tomorrow">("today");
 
   const activeDeliveryDate = useMemo(() => {
     if (dashboardDateMode === "today") {
       return new Date(currentAppTime);
     }
-    if (dashboardDateMode === "tomorrow") {
-      const tomorrow = new Date(currentAppTime);
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      return tomorrow;
-    }
-    // "auto" based on cutoff settings
-    return getActiveDeliveryDate(settings.cutoffHour, settings.cutoffMinute, currentAppTime);
-  }, [dashboardDateMode, settings, currentAppTime]);
+    const tomorrow = new Date(currentAppTime);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    return tomorrow;
+  }, [dashboardDateMode, currentAppTime]);
 
   // Check if the currently viewed delivery date is today
   const isViewingToday = useMemo(() => {
@@ -241,14 +251,7 @@ export default function App() {
     return activeKey === todayKey;
   }, [activeDeliveryDate, currentAppTime]);
 
-  // Check if current system state is past the cutoff (night shift)
-  const isPastCutoff = useMemo(() => {
-    const currentHour = currentAppTime.getHours();
-    const currentMinute = currentAppTime.getMinutes();
-    const currentVal = currentHour * 60 + currentMinute;
-    const cutoffVal = settings.cutoffHour * 60 + settings.cutoffMinute;
-    return currentVal >= cutoffVal;
-  }, [currentAppTime, settings]);
+
 
   // --- Active Tab ---
   // "dashboard" | "history" | "customers"
@@ -449,14 +452,100 @@ export default function App() {
     );
   }, [orders, activeDeliveryDate]);
 
-  // --- Calculate total milk needed for active display date ---
+  // --- Merge Compiled Orders with Delivery Checklist Status and Custom Quantity Overrides ---
+  const ordersWithDeliveryStatus = useMemo(() => {
+    const dateKey = getStableDateKey(activeDeliveryDate);
+    return activeDeliveryOrders.map((order) => {
+      const custId = order.contactId || order.contactPhone;
+      const record = deliveryRecords.find(
+        (r) => r.dateKey === dateKey && r.customerId === custId
+      );
+
+      return {
+        ...order,
+        isDelivered: record ? record.isDelivered : false,
+        deliveredQuantity: record ? record.deliveredQuantity : (order.milkQuantity || 0),
+      };
+    });
+  }, [activeDeliveryOrders, deliveryRecords, activeDeliveryDate]);
+
+  // --- Calculate total milk ordered for active display date ---
   const totalMilkQuantity = useMemo(() => {
-    return activeDeliveryOrders.reduce((sum, order) => {
-      // If order is cancelled, it adds 0
+    return ordersWithDeliveryStatus.reduce((sum, order) => {
       if (order.isCancelled) return sum;
       return sum + (order.milkQuantity || 0);
     }, 0);
-  }, [activeDeliveryOrders]);
+  }, [ordersWithDeliveryStatus]);
+
+  // --- Calculate remaining milk to deliver ---
+  const remainingMilkQuantity = useMemo(() => {
+    return ordersWithDeliveryStatus.reduce((sum, order) => {
+      if (order.isCancelled || order.isDelivered) return sum;
+      return sum + (order.deliveredQuantity || 0);
+    }, 0);
+  }, [ordersWithDeliveryStatus]);
+
+  // --- Toggle Delivery Status ---
+  const handleToggleDelivered = (order: any) => {
+    const dateKey = getStableDateKey(activeDeliveryDate);
+    const custId = order.contactId || order.contactPhone;
+
+    setDeliveryRecords((prev) => {
+      const existingIdx = prev.findIndex(
+        (r) => r.dateKey === dateKey && r.customerId === custId
+      );
+
+      const defaultQty = order.milkQuantity || 0;
+
+      if (existingIdx >= 0) {
+        const updated = [...prev];
+        updated[existingIdx] = {
+          ...updated[existingIdx],
+          isDelivered: !updated[existingIdx].isDelivered,
+        };
+        return updated;
+      } else {
+        const newRecord: DeliveryRecord = {
+          id: `del-${custId}-${dateKey}-${Date.now()}`,
+          dateKey,
+          customerId: custId,
+          isDelivered: true,
+          deliveredQuantity: defaultQty,
+        };
+        return [...prev, newRecord];
+      }
+    });
+  };
+
+  // --- Update Delivered Quantity Overrides ---
+  const handleUpdateDeliveredQuantity = (order: any, quantity: number) => {
+    const dateKey = getStableDateKey(activeDeliveryDate);
+    const custId = order.contactId || order.contactPhone;
+
+    setDeliveryRecords((prev) => {
+      const existingIdx = prev.findIndex(
+        (r) => r.dateKey === dateKey && r.customerId === custId
+      );
+
+      if (existingIdx >= 0) {
+        const updated = [...prev];
+        updated[existingIdx] = {
+          ...updated[existingIdx],
+          deliveredQuantity: quantity,
+        };
+        return updated;
+      } else {
+        const newRecord: DeliveryRecord = {
+          id: `del-${custId}-${dateKey}-${Date.now()}`,
+          dateKey,
+          customerId: custId,
+          isDelivered: false,
+          deliveredQuantity: quantity,
+        };
+        return [...prev, newRecord];
+      }
+    });
+  };
 
   // --- Add Customer ---
   const handleAddCustomer = (e: React.FormEvent) => {
@@ -494,27 +583,97 @@ export default function App() {
   };
 
   // --- Quick Import Preset Customers if list gets empty ---
-  const handleResetToPresets = () => {
+  const handleResetToPresets = async () => {
     if (window.confirm("آیا مایلید لیست مشتریان و تاریخچه سفارشات به مقادیر اولیه و نمونه بازیابی شوند؟")) {
       const mockOrders = generateMockHistory(INITIAL_CUSTOMERS);
       const defaultSettings = { cutoffHour: 20, cutoffMinute: 0 };
+      const defaultDeliveryRecords: DeliveryRecord[] = [];
 
-      // Set state locally first (the global useEffect will automatically sync this to server & localStorage)
+      // Update states immediately
       setCustomers(INITIAL_CUSTOMERS);
       setOrders(mockOrders);
       setSettings(defaultSettings);
-      setUseSimulatedClock(false);
+      setDeliveryRecords(defaultDeliveryRecords);
+
+      // Clear local storage immediately
+      localStorage.setItem("milk_customers", JSON.stringify(INITIAL_CUSTOMERS));
+      localStorage.setItem("milk_orders", JSON.stringify(mockOrders));
+      localStorage.setItem("milk_settings", JSON.stringify(defaultSettings));
+      localStorage.setItem("milk_delivery_records", JSON.stringify(defaultDeliveryRecords));
+
+      // Synchronize lastServerStateRef immediately to prevent subsequent overwrite
+      lastServerStateRef.current = {
+        customers: JSON.stringify(INITIAL_CUSTOMERS),
+        orders: JSON.stringify(mockOrders),
+        settings: JSON.stringify(defaultSettings),
+        deliveryRecords: JSON.stringify(defaultDeliveryRecords),
+      };
+
       addSimLog("کل سیستم به داده‌های نمونه اولیه ریست شد.");
+
+      // Direct synchronous POST to central server to avoid any race conditions
+      try {
+        await fetch("/api/save-state", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            customers: INITIAL_CUSTOMERS,
+            orders: mockOrders,
+            settings: defaultSettings,
+            deliveryRecords: defaultDeliveryRecords
+          }),
+        });
+      } catch (err) {
+        console.error("Direct save failed:", err);
+      }
     }
   };
 
   // --- Wipe entire database ---
-  const handleClearDatabase = () => {
+  const handleClearDatabase = async () => {
     if (window.confirm("⚠️ آیا از حذف کل داده‌های مشتریان و کل تاریخچه سفارشات اطمینان دارید؟ این عمل غیرقابل بازگشت است.")) {
-      // Clear locally first (the global useEffect will automatically sync this to server & localStorage)
-      setCustomers([]);
-      setOrders([]);
+      const emptyCust: Customer[] = [];
+      const emptyOrd: MilkOrder[] = [];
+      const defaultSettings = { cutoffHour: 20, cutoffMinute: 0 };
+      const emptyDelRec: DeliveryRecord[] = [];
+
+      // Update states immediately
+      setCustomers(emptyCust);
+      setOrders(emptyOrd);
+      setDeliveryRecords(emptyDelRec);
+      setSettings(defaultSettings);
+
+      // Clear local storage immediately
+      localStorage.setItem("milk_customers", JSON.stringify(emptyCust));
+      localStorage.setItem("milk_orders", JSON.stringify(emptyOrd));
+      localStorage.setItem("milk_delivery_records", JSON.stringify(emptyDelRec));
+      localStorage.setItem("milk_settings", JSON.stringify(defaultSettings));
+
+      // Synchronize lastServerStateRef immediately to prevent subsequent overwrite
+      lastServerStateRef.current = {
+        customers: JSON.stringify(emptyCust),
+        orders: JSON.stringify(emptyOrd),
+        settings: JSON.stringify(defaultSettings),
+        deliveryRecords: JSON.stringify(emptyDelRec),
+      };
+
       addSimLog("کل پایگاه داده سیستم پاکسازی و خالی شد.");
+
+      // Direct synchronous POST to central server to avoid any race conditions
+      try {
+        await fetch("/api/save-state", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            customers: emptyCust,
+            orders: emptyOrd,
+            settings: defaultSettings,
+            deliveryRecords: emptyDelRec
+          }),
+        });
+      } catch (err) {
+        console.error("Direct save failed:", err);
+      }
     }
   };
 
@@ -617,11 +776,11 @@ export default function App() {
         </div>
 
         {/* Screen Status Bar */}
-        <div className="bg-[#1e293b] text-slate-200 px-6 pt-2 pb-1.5 flex justify-between items-center text-[10px] font-mono z-40 select-none">
+        <div className="bg-[#1e293b] text-slate-200 px-6 pt-2.5 pb-1.5 flex justify-between items-center text-[10px] font-mono z-40">
           <span>{formatPersianTime(currentAppTime)}</span>
           <div className="flex items-center gap-1.5">
             <Clock className="w-3 h-3 text-blue-400" />
-            <span className="text-blue-300">شیفت {isPastCutoff ? "شب" : "روز"}</span>
+            <span className="text-blue-300 font-bold">برنامه توزیع هوشمند</span>
             <div className="w-5 h-2.5 bg-slate-700 rounded-sm relative flex items-center px-0.5">
               <div className="w-3.5 h-1.5 bg-green-500 rounded-xs"></div>
             </div>
@@ -633,10 +792,10 @@ export default function App() {
           
           {/* Active Date & Reporting Header */}
           <header className="bg-white border-b border-slate-200 p-4 shadow-sm shrink-0 flex flex-col gap-2.5">
-            <div className="flex justify-between items-start">
+            <div className="flex justify-between items-start gap-2">
               <div>
                 <div className="flex items-center gap-1.5 mb-0.5">
-                  <h1 className="text-[10px] font-black text-slate-400 uppercase tracking-wider">گزارش سفارشات شیر</h1>
+                  <h1 className="text-[10px] font-black text-slate-400 uppercase tracking-wider">سیستم توزیع شیر</h1>
                   <button 
                     onClick={async () => {
                       setIsParsing(true);
@@ -647,6 +806,9 @@ export default function App() {
                           setCustomers(data.customers);
                           setOrders(data.orders);
                           setSettings(data.settings);
+                          if (data.deliveryRecords) {
+                            setDeliveryRecords(data.deliveryRecords);
+                          }
                           addSimLog("مجدداً از سرور مرکزی همگام‌سازی شد.");
                         }
                       } catch (e) {
@@ -655,10 +817,10 @@ export default function App() {
                         setIsParsing(false);
                       }
                     }}
-                    className="p-1 rounded-full text-slate-300 hover:text-blue-600 hover:bg-blue-50 transition-colors"
-                    title="بروزرسانی داده‌ها از سرور"
+                    className="p-1.5 rounded-full text-slate-300 hover:text-blue-600 hover:bg-blue-50 transition-colors"
+                    title="بروزرسانی داده‌ها"
                   >
-                    <RefreshCw className={`w-3 h-3 ${isParsing ? "animate-spin text-blue-600" : ""}`} />
+                    <RefreshCw className={`w-3.5 h-3.5 ${isParsing ? "animate-spin text-blue-600" : ""}`} />
                   </button>
                   {isSyncing && (
                     <span className="text-[8px] text-slate-400 font-bold bg-slate-100 px-1 py-0.5 rounded animate-pulse">همگام‌سازی...</span>
@@ -670,23 +832,23 @@ export default function App() {
               </div>
               <div className="flex flex-col items-end gap-1.5 shrink-0">
                 <div className="bg-blue-50 text-blue-800 border border-blue-100 rounded-xl px-2.5 py-1 text-[10px] font-bold text-center">
-                  تاریخ سفارش: {formatPersianDateShort(currentAppTime)}
+                  امروز: {formatPersianDateShort(currentAppTime)}
                 </div>
-                <div className="flex gap-1.5">
+                <div className="flex gap-2">
                   <button
                     onClick={() => setShowPasteSMSModal(true)}
-                    className="bg-slate-100 hover:bg-blue-50 hover:text-blue-600 text-slate-600 p-1.5 rounded-lg border border-slate-200/60 transition-all flex items-center gap-1 text-[9px] font-black"
+                    className="bg-slate-100 hover:bg-blue-50 hover:text-blue-600 text-slate-700 h-10 px-3.5 rounded-xl border border-slate-200 transition-all flex items-center gap-1.5 text-xs font-black active:scale-95 shadow-sm"
                     title="ثبت دستی متن پیامک"
                   >
-                    <MessageSquare className="w-3 h-3" />
+                    <MessageSquare className="w-4 h-4 text-blue-600" />
                     <span>ثبت پیامک</span>
                   </button>
                   <button
                     onClick={() => setShowSettingsModal(true)}
-                    className="bg-slate-100 hover:bg-blue-50 hover:text-blue-600 text-slate-600 p-1.5 rounded-lg border border-slate-200/60 transition-all flex items-center gap-1 text-[9px] font-black"
-                    title="تنظیمات پیشرفته"
+                    className="bg-slate-100 hover:bg-blue-50 hover:text-blue-600 text-slate-700 h-10 px-3.5 rounded-xl border border-slate-200 transition-all flex items-center gap-1.5 text-xs font-black active:scale-95 shadow-sm"
+                    title="تنظیمات پایگاه داده"
                   >
-                    <SettingsIcon className="w-3 h-3" />
+                    <SettingsIcon className="w-4 h-4 text-slate-500" />
                     <span>تنظیمات</span>
                   </button>
                 </div>
@@ -695,48 +857,30 @@ export default function App() {
           </header>
           
           {/* Scrollable Screen Content */}
-          <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          <div className="flex-1 overflow-y-auto p-4 pb-24 space-y-4">
             
             {/* Date Mode Segmented Control Tab */}
-            <div className="bg-slate-100/90 p-1 rounded-xl flex gap-1 border border-slate-200/60 shadow-xs shrink-0 select-none">
+            <div className="bg-slate-100/90 p-1.5 rounded-xl flex gap-1.5 border border-slate-200/60 shadow-xs shrink-0">
               <button
                 onClick={() => setDashboardDateMode("today")}
-                className={`flex-1 py-1.5 text-center rounded-lg text-[9px] font-black transition-all ${
+                className={`flex-1 py-2 text-center rounded-lg text-[10px] font-black transition-all ${
                   dashboardDateMode === "today"
-                    ? "bg-white text-blue-700 shadow-xs"
+                    ? "bg-white text-blue-700 shadow-xs border border-slate-200/50"
                     : "text-slate-500 hover:text-slate-800"
                 }`}
               >
-                توزیع امروز ({formatPersianDateShort(currentAppTime)})
+                توزیع شیر امروز ({formatPersianDateShort(currentAppTime)})
               </button>
               
               <button
-                onClick={() => setDashboardDateMode("auto")}
-                className={`flex-1 py-1.5 text-center rounded-lg text-[9px] font-black transition-all relative ${
-                  dashboardDateMode === "auto"
-                    ? "bg-blue-600 text-white shadow-xs"
-                    : "text-slate-500 hover:text-slate-800"
-                }`}
-              >
-                <span>خودکار ({isPastCutoff ? "شیفت شب/فردا" : "شیفت روز/امروز"})</span>
-                {dashboardDateMode !== "auto" && (
-                  <span className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-blue-500 rounded-full animate-pulse border border-white" />
-                )}
-              </button>
-              
-              <button
-                onClick={() => {
-                  const tm = new Date(currentAppTime);
-                  tm.setDate(tm.getDate() + 1);
-                  setDashboardDateMode("tomorrow");
-                }}
-                className={`flex-1 py-1.5 text-center rounded-lg text-[9px] font-black transition-all ${
+                onClick={() => setDashboardDateMode("tomorrow")}
+                className={`flex-1 py-2 text-center rounded-lg text-[10px] font-black transition-all ${
                   dashboardDateMode === "tomorrow"
-                    ? "bg-white text-blue-700 shadow-xs"
+                    ? "bg-white text-blue-700 shadow-xs border border-slate-200/50"
                     : "text-slate-500 hover:text-slate-800"
                 }`}
               >
-                آماده‌سازی فردا ({
+                سفارشات فردا ({
                   (() => {
                     const tm = new Date(currentAppTime);
                     tm.setDate(tm.getDate() + 1);
@@ -746,16 +890,20 @@ export default function App() {
               </button>
             </div>
 
-            {/* Total Indicator Panel */}
-            <div className="bg-gradient-to-r from-blue-600 to-indigo-600 text-white rounded-2xl p-3 flex justify-between items-center shadow-md animate-fadeIn">
-              <div className="space-y-0.5">
-                <span className="text-[10px] text-blue-100 font-bold block">مجموع کل شیر مورد نیاز {isViewingToday ? "امروز" : "فردا"}</span>
-                <p className="text-xl font-black">
-                  {totalMilkQuantity.toLocaleString("fa-IR")} <span className="text-xs font-normal">کیلوگرم</span>
+            {/* Total & Remaining Indicators Panel Grid */}
+            <div className="grid grid-cols-2 gap-3 animate-fadeIn">
+              <div className="bg-gradient-to-br from-blue-600 to-blue-700 text-white rounded-2xl p-3 flex flex-col justify-between shadow-md border border-blue-500/20">
+                <span className="text-[10px] text-blue-100 font-bold block mb-1">کل شیر سفارش شده</span>
+                <p className="text-lg font-black font-mono">
+                  {totalMilkQuantity.toLocaleString("fa-IR")} <span className="text-[10px] font-normal font-sans">کیلوگرم</span>
                 </p>
               </div>
-              <div className="w-10 h-10 bg-white/10 rounded-xl flex items-center justify-center">
-                <Layers className="w-5 h-5 text-white" />
+
+              <div className="bg-gradient-to-br from-emerald-600 to-teal-700 text-white rounded-2xl p-3 flex flex-col justify-between shadow-md border border-emerald-500/20">
+                <span className="text-[10px] text-emerald-100 font-bold block mb-1">باقیمانده برای توزیع</span>
+                <p className="text-lg font-black font-mono">
+                  {remainingMilkQuantity.toLocaleString("fa-IR")} <span className="text-[10px] font-normal font-sans">کیلوگرم</span>
+                </p>
               </div>
             </div>
 
@@ -796,7 +944,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  {activeDeliveryOrders.length === 0 ? (
+                  {ordersWithDeliveryStatus.length === 0 ? (
                     <div className="bg-white rounded-2xl border border-slate-200 p-8 text-center space-y-3 shadow-xs">
                       <div className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center mx-auto">
                         <Calendar className="w-6 h-6 text-slate-400" />
@@ -814,14 +962,14 @@ export default function App() {
                       <table className="w-full text-right text-[11px] border-collapse">
                         <thead>
                           <tr className="bg-slate-50 text-slate-500 font-bold border-b border-slate-200">
-                            <th className="p-2.5 text-center w-8">ردیف</th>
+                            <th className="p-2.5 text-center w-10">تحویل</th>
                             <th className="p-2.5">نام مشتری</th>
-                            <th className="p-2.5 text-center">ساعت سفارش</th>
-                            <th className="p-2.5 text-left pl-3">مقدار (کیلو)</th>
+                            <th className="p-2.5 text-center">ساعت</th>
+                            <th className="p-2.5 text-left pl-3">مقدار توزیعی (کیلو)</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100">
-                          {activeDeliveryOrders.map((order, index) => (
+                          {ordersWithDeliveryStatus.map((order, index) => (
                             <tr
                               key={order.id}
                               onClick={() => {
@@ -830,14 +978,26 @@ export default function App() {
                               }}
                               className={`hover:bg-slate-50/80 cursor-pointer transition-colors ${
                                 order.isCancelled ? "bg-red-50/10 text-slate-400" : ""
-                              }`}
+                              } ${order.isDelivered ? "bg-emerald-50/20" : ""}`}
                             >
-                              <td className="p-2.5 text-center text-slate-400 font-mono font-bold">
-                                {(index + 1).toLocaleString("fa-IR")}
+                              <td className="p-2.5 text-center" onClick={(e) => e.stopPropagation()}>
+                                <button
+                                  type="button"
+                                  onClick={() => handleToggleDelivered(order)}
+                                  className={`w-6 h-6 rounded-lg flex items-center justify-center mx-auto transition-all border ${
+                                    order.isDelivered
+                                      ? "bg-emerald-500 border-emerald-500 text-white shadow-sm"
+                                      : "bg-white border-slate-300 text-transparent hover:border-blue-500"
+                                  }`}
+                                >
+                                  <Check className="w-4 h-4 stroke-[3px]" />
+                                </button>
                               </td>
                               <td className="p-2.5 font-bold text-slate-800">
                                 <div className="flex items-center gap-1.5">
-                                  <span>{order.contactName}</span>
+                                  <span className={order.isDelivered ? "line-through text-slate-400" : "text-slate-800"}>
+                                    {order.contactName}
+                                  </span>
                                   {order.isCancelled && (
                                     <span className="text-[8px] bg-red-100 text-red-700 font-black px-1 rounded">کنسل</span>
                                   )}
@@ -846,13 +1006,29 @@ export default function App() {
                               <td className="p-2.5 text-center text-slate-500 font-mono">
                                 {formatPersianTime(new Date(order.receivedAt))}
                               </td>
-                              <td className="p-2.5 text-left pl-3 font-mono">
+                              <td className="p-2.5 text-left pl-3 font-mono" onClick={(e) => e.stopPropagation()}>
                                 {order.isCancelled ? (
-                                  <span className="text-red-600 font-bold line-through">۰</span>
+                                  <span className="text-red-600 font-bold line-through pl-4">۰</span>
                                 ) : (
-                                  <span className="text-slate-900 font-black text-xs">
-                                    {(order.milkQuantity || 0).toLocaleString("fa-IR")}
-                                  </span>
+                                  <div className="flex items-center justify-end gap-1.5">
+                                    {order.deliveredQuantity !== order.milkQuantity && (
+                                      <span className="text-[9px] text-slate-400 line-through">
+                                        {order.milkQuantity}
+                                      </span>
+                                    )}
+                                    <input
+                                      type="number"
+                                      min="0"
+                                      value={order.deliveredQuantity}
+                                      onChange={(e) => handleUpdateDeliveredQuantity(order, Number(e.target.value))}
+                                      className={`w-14 p-1 rounded-lg text-center font-bold text-xs border transition-all ${
+                                        order.isDelivered
+                                          ? "bg-emerald-100 border-emerald-200 text-emerald-800"
+                                          : "bg-slate-50 border-slate-200 focus:border-blue-500 text-slate-800"
+                                      }`}
+                                    />
+                                    <span className="text-[10px] text-slate-400">کیلو</span>
+                                  </div>
                                 )}
                               </td>
                             </tr>
@@ -860,7 +1036,7 @@ export default function App() {
                         </tbody>
                       </table>
                       <div className="bg-slate-50/50 p-2.5 border-t border-slate-200 flex justify-between items-center text-[10px] text-slate-500 font-bold">
-                        <span>مجموع شیر توزیعی:</span>
+                        <span>مجموع شیر سفارش داده شده:</span>
                         <span className="text-blue-700 font-black text-xs">
                           {totalMilkQuantity.toLocaleString("fa-IR")} کیلوگرم
                         </span>
@@ -869,7 +1045,7 @@ export default function App() {
                   ) : (
                     /* DETAILED CARDS VIEW WITH ORIGINAL SMS TEXT */
                     <div className="space-y-2">
-                      {activeDeliveryOrders.map((order) => (
+                      {ordersWithDeliveryStatus.map((order) => (
                         <div
                           key={order.id}
                           onClick={() => {
@@ -877,21 +1053,32 @@ export default function App() {
                             if (c) setSelectedDetailCustomer(c);
                           }}
                           className={`p-3 bg-white rounded-2xl border transition-all hover:border-blue-300 shadow-xs cursor-pointer flex flex-col gap-2 relative group overflow-hidden ${
-                            order.isCancelled ? "border-red-100 bg-red-50/20" : "border-slate-200/80"
+                            order.isCancelled 
+                              ? "border-red-100 bg-red-50/20" 
+                              : order.isDelivered 
+                                ? "border-emerald-200 bg-emerald-50/5" 
+                                : "border-slate-200/80"
                           }`}
                         >
-                          {/* Cancel indicator accent */}
+                          {/* Cancel/Delivered indicator accent */}
                           {order.isCancelled && (
                             <div className="absolute top-0 right-0 h-full w-1 bg-red-500" />
                           )}
-                          {!order.isCancelled && (
+                          {!order.isCancelled && order.isDelivered && (
                             <div className="absolute top-0 right-0 h-full w-1 bg-emerald-500" />
+                          )}
+                          {!order.isCancelled && !order.isDelivered && (
+                            <div className="absolute top-0 right-0 h-full w-1 bg-blue-500" />
                           )}
 
                           <div className="flex justify-between items-center">
                             <div className="flex items-center gap-2">
                               <div className={`w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs ${
-                                order.isCancelled ? "bg-red-100 text-red-700" : "bg-blue-100 text-blue-700"
+                                order.isCancelled 
+                                  ? "bg-red-100 text-red-700" 
+                                  : order.isDelivered
+                                    ? "bg-emerald-100 text-emerald-700"
+                                    : "bg-blue-100 text-blue-700"
                               }`}>
                                 {order.contactName.substring(0, 2)}
                               </div>
@@ -905,9 +1092,16 @@ export default function App() {
                               {order.isCancelled ? (
                                 <span className="text-xs font-black text-red-600 bg-red-100 px-2 py-0.5 rounded-lg">لغو شده</span>
                               ) : (
-                                <span className="text-sm font-black text-slate-900 italic">
-                                  {order.milkQuantity} <span className="text-[10px] font-normal not-italic">کیلو</span>
-                                </span>
+                                <div className="flex flex-col items-end">
+                                  <span className={`text-sm font-black italic ${order.isDelivered ? "text-emerald-700" : "text-slate-900"}`}>
+                                    {order.deliveredQuantity} <span className="text-[10px] font-normal not-italic">کیلو</span>
+                                  </span>
+                                  {order.deliveredQuantity !== order.milkQuantity && (
+                                    <span className="text-[9px] text-slate-400 line-through">
+                                      سفارش: {order.milkQuantity} کیلو
+                                    </span>
+                                  )}
+                                </div>
                               )}
                               <span className="text-[9px] text-slate-400 block mt-0.5">
                                 {formatPersianTime(new Date(order.receivedAt))}
@@ -922,96 +1116,51 @@ export default function App() {
                               <span>تفسیر: {order.explanation}</span>
                             </p>
                           </div>
+
+                          {/* Quick Delivery Actions inside detailed card */}
+                          <div className="flex justify-between items-center mt-1 pt-2 border-t border-slate-150" onClick={(e) => e.stopPropagation()}>
+                            <button
+                              type="button"
+                              onClick={() => handleToggleDelivered(order)}
+                              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-[10px] font-black transition-all ${
+                                order.isDelivered
+                                  ? "bg-emerald-500 border-emerald-500 text-white"
+                                  : "bg-slate-100 border-slate-200 text-slate-600 hover:bg-slate-200"
+                              }`}
+                            >
+                              <Check className="w-3.5 h-3.5" />
+                              <span>{order.isDelivered ? "تحویل شده" : "علامت تحویل"}</span>
+                            </button>
+
+                            {!order.isCancelled && (
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-[10px] text-slate-400 font-bold">توزیع:</span>
+                                <input
+                                  type="number"
+                                  min="0"
+                                  value={order.deliveredQuantity}
+                                  onChange={(e) => handleUpdateDeliveredQuantity(order, Number(e.target.value))}
+                                  className="w-14 p-1 bg-slate-50 border border-slate-200 focus:border-blue-500 rounded-lg text-center font-bold text-xs"
+                                />
+                                <span className="text-[10px] text-slate-400">کیلو</span>
+                              </div>
+                            )}
+                          </div>
                         </div>
                       ))}
                     </div>
                   )}
                 </div>
 
-                {/* Quick Interactive Settings Inside Tab */}
-                <div className="bg-white rounded-2xl border border-slate-200 p-4 space-y-3 shadow-xs">
-                  <div className="flex items-center justify-between">
-                    <h4 className="text-xs font-black text-slate-700 flex items-center gap-1.5">
-                      <Sliders className="w-4 h-4 text-slate-500" />
-                      تنظیمات شیفت و زمان شبیه‌ساز
-                    </h4>
+                {/* Clean Guide Banner instead of clunky settings */}
+                <div className="bg-slate-50 rounded-2xl border border-slate-200/60 p-3.5 space-y-2.5">
+                  <div className="flex items-center gap-1.5 text-blue-800">
+                    <Sparkles className="w-4 h-4 text-blue-500" />
+                    <span className="text-[11px] font-black">راهنمای هوشمند توزیع شیر</span>
                   </div>
-
-                  <div className="space-y-2 text-xs">
-                    <div className="flex justify-between items-center bg-slate-50 p-2.5 rounded-xl border border-slate-100">
-                      <div>
-                        <p className="font-bold text-slate-700">ساعت تغییر شیفت</p>
-                        <p className="text-[9px] text-slate-400">سفارش فردا از ساعت چند نمایش داده شود؟</p>
-                      </div>
-                      <div className="flex items-center gap-1.5">
-                        <select
-                          value={settings.cutoffHour}
-                          onChange={(e) => setSettings({ ...settings, cutoffHour: parseInt(e.target.value) })}
-                          className="bg-white border border-slate-200 rounded px-2 py-1 font-bold text-slate-800"
-                        >
-                          {Array.from({ length: 24 }).map((_, h) => (
-                            <option key={h} value={h}>{h < 10 ? `0${h}` : h}:00</option>
-                          ))}
-                        </select>
-                      </div>
-                    </div>
-
-                    <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100 space-y-2">
-                      <div className="flex justify-between items-center">
-                        <div>
-                          <p className="font-bold text-slate-700">تست و تغییر زمان سیستم</p>
-                          <p className="text-[9px] text-slate-400">برای آزمایش نحوه جابجایی خودکار شیفت‌ها</p>
-                        </div>
-                        <button
-                          onClick={() => setUseSimulatedClock(!useSimulatedClock)}
-                          className={`px-2.5 py-1 rounded text-[9px] font-black transition-all ${
-                            useSimulatedClock 
-                              ? "bg-blue-600 text-white" 
-                              : "bg-slate-200 text-slate-600"
-                          }`}
-                        >
-                          {useSimulatedClock ? "ساعت مجازی" : "ساعت واقعی گوشی"}
-                        </button>
-                      </div>
-
-                      {useSimulatedClock && (
-                        <div className="flex gap-2 items-center justify-end pt-1 border-t border-slate-200/50">
-                          <span className="text-[10px] text-slate-500">ساعت فرضی:</span>
-                          <input
-                            type="range"
-                            min="0"
-                            max="23"
-                            value={simulatedHour}
-                            onChange={(e) => setSimulatedHour(parseInt(e.target.value))}
-                            className="w-24 accent-blue-600 h-1 bg-slate-200 rounded-lg appearance-none cursor-pointer"
-                          />
-                          <span className="font-bold text-blue-600 bg-white border border-blue-100 px-1.5 py-0.5 rounded font-mono text-[10px]">
-                            {simulatedHour < 10 ? `0${simulatedHour}` : simulatedHour}:00
-                          </span>
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Database Management Tools */}
-                    <div className="border-t border-slate-150 pt-3 mt-3 space-y-2">
-                      <p className="font-bold text-slate-700">مدیریت پایگاه داده و اطلاعات مشتریان</p>
-                      <p className="text-[9px] text-slate-400 leading-relaxed">جهت پاکسازی کل مشتریان و سفارشات فرضی نمونه برای شروع کار با داده‌های واقعی خودتان</p>
-                      <div className="flex gap-2 pt-1">
-                        <button
-                          onClick={handleClearDatabase}
-                          className="flex-1 bg-red-50 hover:bg-red-100 text-red-600 border border-red-100 py-2 rounded-xl font-bold text-[10px] transition-colors"
-                        >
-                          پاکسازی کامل داده‌ها
-                        </button>
-                        <button
-                          onClick={handleResetToPresets}
-                          className="flex-1 bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200/60 py-2 rounded-xl font-bold text-[10px] transition-colors"
-                        >
-                          بازیابی داده‌های فرضی نمونه
-                        </button>
-                      </div>
-                    </div>
-                  </div>
+                  <p className="text-[10px] text-slate-500 leading-relaxed">
+                    این سیستم برای توزیع روزانه شیر طراحی شده است. تمام سفارشات دریافتی امروز به صورت خودکار برای تحویل فردا برنامه‌ریزی می‌شوند. برای دسترسی به مدیریت کل داده‌ها و پاکسازی پایگاه داده، از دکمه تنظیمات در بالای صفحه استفاده کنید.
+                  </p>
                 </div>
 
               </div>
@@ -1422,7 +1571,7 @@ export default function App() {
                 <div className="flex justify-between items-center border-b border-slate-100 pb-3">
                   <div className="flex items-center gap-2">
                     <SettingsIcon className="w-5 h-5 text-blue-600" />
-                    <h4 className="text-xs font-black text-slate-800">تنظیمات پیشرفته زمان و شیفت</h4>
+                    <h4 className="text-xs font-black text-slate-800">تنظیمات و مدیریت پایگاه داده</h4>
                   </div>
                   <button
                     onClick={() => setShowSettingsModal(false)}
@@ -1433,88 +1582,48 @@ export default function App() {
                 </div>
 
                 <div className="space-y-4 text-xs">
-                  {/* Cutoff Settings */}
-                  <div className="space-y-2 border-b border-slate-100 pb-3">
-                    <span className="font-bold text-slate-700 block">ساعت نهایی بستن سفارشات (ساعت Cutoff):</span>
-                    <p className="text-[10px] text-slate-400 leading-relaxed">
-                      سفارشاتی که پس از این ساعت دریافت شوند به عنوان سفارش روز پس از فردا در نظر گرفته خواهند شد.
+                  {/* Workflow Guide */}
+                  <div className="space-y-1.5 bg-blue-50/50 p-3 rounded-2xl border border-blue-100">
+                    <span className="font-bold text-blue-800 block">نحوه کارکرد توزیع روزانه:</span>
+                    <p className="text-[10px] text-slate-600 leading-relaxed">
+                      سیستم هوشمند به گونه‌ای طراحی شده است که تمام پیامک‌های دریافت شده امروز را به عنوان سفارش شیر برای فردا تفسیر می‌کند. 
+                      برنامه توزیع به شما اجازه می‌دهد در طول روز تحویل هر مشتری را علامت بزنید و در صورت نیاز مقدار تحویل داده شده را در محل ویرایش کنید.
                     </p>
-                    <div className="flex items-center gap-2">
-                      <select
-                        value={settings.cutoffHour}
-                        onChange={(e) => setSettings(prev => ({ ...prev, cutoffHour: parseInt(e.target.value) }))}
-                        className="bg-slate-50 border border-slate-200 rounded-xl p-2 font-black text-center flex-1"
-                      >
-                        {Array.from({ length: 24 }).map((_, i) => (
-                          <option key={i} value={i}>
-                            ساعت {String(i).padStart(2, "0")}
-                          </option>
-                        ))}
-                      </select>
-                      <span className="text-slate-400">:</span>
-                      <select
-                        value={settings.cutoffMinute}
-                        onChange={(e) => setSettings(prev => ({ ...prev, cutoffMinute: parseInt(e.target.value) }))}
-                        className="bg-slate-50 border border-slate-200 rounded-xl p-2 font-black text-center flex-1"
-                      >
-                        {[0, 15, 30, 45].map((m) => (
-                          <option key={m} value={m}>
-                            {String(m).padStart(2, "0")} دقیقه
-                          </option>
-                        ))}
-                      </select>
-                    </div>
                   </div>
 
-                  {/* Simulated Clock Toggle */}
-                  <div className="space-y-2 pb-2">
-                    <div className="flex justify-between items-center">
-                      <span className="font-bold text-slate-700">تست شیفت شب با ساعت مجازی:</span>
-                      <input
-                        type="checkbox"
-                        checked={useSimulatedClock}
-                        onChange={(e) => setUseSimulatedClock(e.target.checked)}
-                        className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
-                      />
+                  {/* Database Management Tools */}
+                  <div className="space-y-2 pt-2">
+                    <span className="font-bold text-slate-700 block">مدیریت اطلاعات و پاکسازی:</span>
+                    <p className="text-[10px] text-slate-400 leading-relaxed">
+                      برای شروع به کار با داده‌های واقعی خود، می‌توانید اطلاعات فرضی و دمو سیستم را به طور کامل پاک کنید.
+                    </p>
+                    <div className="flex gap-2 pt-1">
+                      <button
+                        onClick={async () => {
+                          await handleClearDatabase();
+                          setShowSettingsModal(false);
+                        }}
+                        className="flex-1 bg-red-50 hover:bg-red-100 text-red-600 border border-red-100 py-2.5 rounded-xl font-bold text-[10px] transition-colors"
+                      >
+                        پاکسازی کامل داده‌ها
+                      </button>
+                      <button
+                        onClick={async () => {
+                          await handleResetToPresets();
+                          setShowSettingsModal(false);
+                        }}
+                        className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 py-2.5 rounded-xl font-bold text-[10px] transition-colors"
+                      >
+                        بازیابی داده‌های دمو
+                      </button>
                     </div>
-                    
-                    {useSimulatedClock && (
-                      <div className="bg-blue-50/50 p-3 rounded-2xl border border-blue-100 space-y-2 animate-fadeIn">
-                        <span className="text-[10px] text-blue-800 font-bold block">تنظیم ساعت شبیه‌سازی:</span>
-                        <div className="flex items-center gap-2">
-                          <select
-                            value={simulatedHour}
-                            onChange={(e) => setSimulatedHour(parseInt(e.target.value))}
-                            className="bg-white border border-slate-200 rounded-lg p-1.5 font-bold text-center flex-1"
-                          >
-                            {Array.from({ length: 24 }).map((_, i) => (
-                              <option key={i} value={i}>
-                                ساعت {String(i).padStart(2, "0")}
-                              </option>
-                            ))}
-                          </select>
-                          <span className="text-slate-400">:</span>
-                          <select
-                            value={simulatedMinute}
-                            onChange={(e) => setSimulatedMinute(parseInt(e.target.value))}
-                            className="bg-white border border-slate-200 rounded-lg p-1.5 font-bold text-center flex-1"
-                          >
-                            {Array.from({ length: 60 }).map((_, i) => (
-                              <option key={i} value={i}>
-                                {String(i).padStart(2, "0")} دقیقه
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                      </div>
-                    )}
                   </div>
 
                   <button
                     onClick={() => setShowSettingsModal(false)}
-                    className="w-full bg-slate-900 text-white py-2.5 rounded-xl font-bold hover:bg-slate-800 transition-colors"
+                    className="w-full bg-slate-900 text-white py-2.5 rounded-xl font-bold hover:bg-slate-800 transition-colors mt-2"
                   >
-                    بستن و اعمال تنظیمات
+                    بستن پنجره
                   </button>
                 </div>
               </div>

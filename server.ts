@@ -43,11 +43,12 @@ async function startServer() {
   // Save full state or partials
   app.post("/api/save-state", (req, res) => {
     try {
-      const { customers, orders, settings } = req.body;
+      const { customers, orders, settings, deliveryRecords } = req.body;
       const db = loadDatabase();
-      if (customers) db.customers = customers;
-      if (orders) db.orders = orders;
-      if (settings) db.settings = settings;
+      if (customers !== undefined) db.customers = customers;
+      if (orders !== undefined) db.orders = orders;
+      if (settings !== undefined) db.settings = settings;
+      if (deliveryRecords !== undefined) db.deliveryRecords = deliveryRecords;
       saveDatabase(db);
       res.json({ success: true, db });
     } catch (error: any) {

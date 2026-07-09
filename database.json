@@ -1,0 +1,8 @@
+{
+  "customers": [],
+  "orders": [],
+  "settings": {
+    "cutoffHour": 20,
+    "cutoffMinute": 0
+  }
+}
