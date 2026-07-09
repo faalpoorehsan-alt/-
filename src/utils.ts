@@ -85,11 +85,24 @@ export function getStableDateKey(date: Date): string {
 
 /**
  * Gets the delivery date for an order received at a specific time.
- * If received today, the default target delivery is "tomorrow" (the day after reception).
- * If the AI detects something else, we can manually override.
+ * If received today before the cutoff hour, the default target delivery is tomorrow (receivedDate + 1 day).
+ * If received today after the cutoff hour, tomorrow's delivery list is already locked, so target delivery is the day after tomorrow (receivedDate + 2 days).
  */
-export function getDeliveryDateForOrderReceivedAt(receivedDate: Date): Date {
+export function getDeliveryDateForOrderReceivedAt(
+  receivedDate: Date,
+  cutoffHour: number = 20,
+  cutoffMinute: number = 0
+): Date {
   const target = new Date(receivedDate);
-  target.setDate(target.getDate() + 1); // Defaults to tomorrow
+  const cutoffTime = new Date(receivedDate);
+  cutoffTime.setHours(cutoffHour, cutoffMinute, 0, 0);
+
+  if (receivedDate >= cutoffTime) {
+    // Past cutoff time, target delivery is the day after tomorrow
+    target.setDate(target.getDate() + 2);
+  } else {
+    // Before cutoff time, target delivery is tomorrow
+    target.setDate(target.getDate() + 1);
+  }
   return target;
 }

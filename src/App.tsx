@@ -139,7 +139,23 @@ export default function App() {
   // Polling for new background SMS orders every 5 seconds
   useEffect(() => {
     let active = true;
+
+    // Check if we have any pending local changes that are not synced yet
+    const localCustStr = JSON.stringify(customers);
+    const localOrdStr = JSON.stringify(orders);
+    const localSetStr = JSON.stringify(settings);
+
+    const hasUnsavedChanges =
+      localCustStr !== lastServerStateRef.current.customers ||
+      localOrdStr !== lastServerStateRef.current.orders ||
+      localSetStr !== lastServerStateRef.current.settings;
+
     const interval = setInterval(async () => {
+      // If we are actively saving or have pending local changes, skip polling to avoid race conditions/overwriting
+      if (hasUnsavedChanges || isSyncing) {
+        return;
+      }
+
       try {
         const res = await fetch("/api/data");
         if (res.ok && active) {
@@ -149,20 +165,20 @@ export default function App() {
           const serverOrdStr = JSON.stringify(data.orders || []);
           const serverSetStr = JSON.stringify(data.settings || {});
 
-          const localCustStr = JSON.stringify(customers);
-          const localOrdStr = JSON.stringify(orders);
-          const localSetStr = JSON.stringify(settings);
+          const currentCustStr = JSON.stringify(customers);
+          const currentOrdStr = JSON.stringify(orders);
+          const currentSetStr = JSON.stringify(settings);
 
           // Update only if server differs from our last state, AND we haven't mutated it differently locally
-          if (serverCustStr !== lastServerStateRef.current.customers && serverCustStr !== localCustStr) {
+          if (serverCustStr !== lastServerStateRef.current.customers && serverCustStr !== currentCustStr) {
             lastServerStateRef.current.customers = serverCustStr;
             setCustomers(data.customers);
           }
-          if (serverOrdStr !== lastServerStateRef.current.orders && serverOrdStr !== localOrdStr) {
+          if (serverOrdStr !== lastServerStateRef.current.orders && serverOrdStr !== currentOrdStr) {
             lastServerStateRef.current.orders = serverOrdStr;
             setOrders(data.orders);
           }
-          if (serverSetStr !== lastServerStateRef.current.settings && serverSetStr !== localSetStr) {
+          if (serverSetStr !== lastServerStateRef.current.settings && serverSetStr !== currentSetStr) {
             lastServerStateRef.current.settings = serverSetStr;
             setSettings(data.settings);
           }
@@ -177,7 +193,7 @@ export default function App() {
       active = false;
       clearInterval(interval);
     };
-  }, [customers, orders, settings]);
+  }, [customers, orders, settings, isSyncing]);
 
   // --- Simulated Clock for Testing ---
   const [useSimulatedClock, setUseSimulatedClock] = useState<boolean>(false);
@@ -201,9 +217,29 @@ export default function App() {
     return date;
   }, [useSimulatedClock, simulatedHour, simulatedMinute, realTime]);
 
+  // --- Active Delivery Date Toggle Mode ---
+  // "auto" (uses cutoff settings) | "today" (shows today's delivery) | "tomorrow" (shows tomorrow's delivery)
+  const [dashboardDateMode, setDashboardDateMode] = useState<"auto" | "today" | "tomorrow">("auto");
+
   const activeDeliveryDate = useMemo(() => {
+    if (dashboardDateMode === "today") {
+      return new Date(currentAppTime);
+    }
+    if (dashboardDateMode === "tomorrow") {
+      const tomorrow = new Date(currentAppTime);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      return tomorrow;
+    }
+    // "auto" based on cutoff settings
     return getActiveDeliveryDate(settings.cutoffHour, settings.cutoffMinute, currentAppTime);
-  }, [settings, currentAppTime]);
+  }, [dashboardDateMode, settings, currentAppTime]);
+
+  // Check if the currently viewed delivery date is today
+  const isViewingToday = useMemo(() => {
+    const activeKey = getStableDateKey(activeDeliveryDate);
+    const todayKey = getStableDateKey(currentAppTime);
+    return activeKey === todayKey;
+  }, [activeDeliveryDate, currentAppTime]);
 
   // Check if current system state is past the cutoff (night shift)
   const isPastCutoff = useMemo(() => {
@@ -285,7 +321,7 @@ export default function App() {
       const result = parseMilkMessageLocally(textToParse, contact.name);
       
       const now = new Date(currentAppTime);
-      const deliveryDate = getDeliveryDateForOrderReceivedAt(now);
+      const deliveryDate = getDeliveryDateForOrderReceivedAt(now, settings.cutoffHour, settings.cutoffMinute);
 
       const newOrder: MilkOrder = {
         id: "order-" + Date.now() + Math.random().toString(36).substring(2, 5),
@@ -327,7 +363,7 @@ export default function App() {
     // 1. Get all requests for this delivery date
     const matchingRequests = orders.filter((order) => {
       const orderReceivedDate = new Date(order.receivedAt);
-      const orderDeliveryDate = getDeliveryDateForOrderReceivedAt(orderReceivedDate);
+      const orderDeliveryDate = getDeliveryDateForOrderReceivedAt(orderReceivedDate, settings.cutoffHour, settings.cutoffMinute);
       const orderDeliveryDateKey = getStableDateKey(orderDeliveryDate);
       return orderDeliveryDateKey === activeDateKey && order.isMilkRequest;
     });
@@ -460,15 +496,14 @@ export default function App() {
   // --- Quick Import Preset Customers if list gets empty ---
   const handleResetToPresets = () => {
     if (window.confirm("آیا مایلید لیست مشتریان و تاریخچه سفارشات به مقادیر اولیه و نمونه بازیابی شوند؟")) {
+      const mockOrders = generateMockHistory(INITIAL_CUSTOMERS);
+      const defaultSettings = { cutoffHour: 20, cutoffMinute: 0 };
+
+      // Set state locally first (the global useEffect will automatically sync this to server & localStorage)
       setCustomers(INITIAL_CUSTOMERS);
-      setOrders(generateMockHistory(INITIAL_CUSTOMERS));
-      setSettings({ cutoffHour: 20, cutoffMinute: 0 });
+      setOrders(mockOrders);
+      setSettings(defaultSettings);
       setUseSimulatedClock(false);
-      lastServerStateRef.current = {
-        customers: "",
-        orders: "",
-        settings: ""
-      };
       addSimLog("کل سیستم به داده‌های نمونه اولیه ریست شد.");
     }
   };
@@ -476,15 +511,9 @@ export default function App() {
   // --- Wipe entire database ---
   const handleClearDatabase = () => {
     if (window.confirm("⚠️ آیا از حذف کل داده‌های مشتریان و کل تاریخچه سفارشات اطمینان دارید؟ این عمل غیرقابل بازگشت است.")) {
+      // Clear locally first (the global useEffect will automatically sync this to server & localStorage)
       setCustomers([]);
       setOrders([]);
-      localStorage.removeItem("milk_customers");
-      localStorage.removeItem("milk_orders");
-      lastServerStateRef.current = {
-        customers: "[]",
-        orders: "[]",
-        settings: JSON.stringify(settings)
-      };
       addSimLog("کل پایگاه داده سیستم پاکسازی و خالی شد.");
     }
   };
@@ -668,10 +697,59 @@ export default function App() {
           {/* Scrollable Screen Content */}
           <div className="flex-1 overflow-y-auto p-4 space-y-4">
             
+            {/* Date Mode Segmented Control Tab */}
+            <div className="bg-slate-100/90 p-1 rounded-xl flex gap-1 border border-slate-200/60 shadow-xs shrink-0 select-none">
+              <button
+                onClick={() => setDashboardDateMode("today")}
+                className={`flex-1 py-1.5 text-center rounded-lg text-[9px] font-black transition-all ${
+                  dashboardDateMode === "today"
+                    ? "bg-white text-blue-700 shadow-xs"
+                    : "text-slate-500 hover:text-slate-800"
+                }`}
+              >
+                توزیع امروز ({formatPersianDateShort(currentAppTime)})
+              </button>
+              
+              <button
+                onClick={() => setDashboardDateMode("auto")}
+                className={`flex-1 py-1.5 text-center rounded-lg text-[9px] font-black transition-all relative ${
+                  dashboardDateMode === "auto"
+                    ? "bg-blue-600 text-white shadow-xs"
+                    : "text-slate-500 hover:text-slate-800"
+                }`}
+              >
+                <span>خودکار ({isPastCutoff ? "شیفت شب/فردا" : "شیفت روز/امروز"})</span>
+                {dashboardDateMode !== "auto" && (
+                  <span className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-blue-500 rounded-full animate-pulse border border-white" />
+                )}
+              </button>
+              
+              <button
+                onClick={() => {
+                  const tm = new Date(currentAppTime);
+                  tm.setDate(tm.getDate() + 1);
+                  setDashboardDateMode("tomorrow");
+                }}
+                className={`flex-1 py-1.5 text-center rounded-lg text-[9px] font-black transition-all ${
+                  dashboardDateMode === "tomorrow"
+                    ? "bg-white text-blue-700 shadow-xs"
+                    : "text-slate-500 hover:text-slate-800"
+                }`}
+              >
+                آماده‌سازی فردا ({
+                  (() => {
+                    const tm = new Date(currentAppTime);
+                    tm.setDate(tm.getDate() + 1);
+                    return formatPersianDateShort(tm);
+                  })()
+                })
+              </button>
+            </div>
+
             {/* Total Indicator Panel */}
             <div className="bg-gradient-to-r from-blue-600 to-indigo-600 text-white rounded-2xl p-3 flex justify-between items-center shadow-md animate-fadeIn">
               <div className="space-y-0.5">
-                <span className="text-[10px] text-blue-100 font-bold block">مجموع کل شیر مورد نیاز فردا</span>
+                <span className="text-[10px] text-blue-100 font-bold block">مجموع کل شیر مورد نیاز {isViewingToday ? "امروز" : "فردا"}</span>
                 <p className="text-xl font-black">
                   {totalMilkQuantity.toLocaleString("fa-IR")} <span className="text-xs font-normal">کیلوگرم</span>
                 </p>
@@ -689,7 +767,7 @@ export default function App() {
                 <div className="space-y-2.5">
                   <div className="flex justify-between items-center border-b border-slate-100 pb-2">
                     <div>
-                      <h3 className="text-xs font-black text-slate-700">برنامه توزیع شیر فردا</h3>
+                      <h3 className="text-xs font-black text-slate-700">برنامه توزیع شیر {isViewingToday ? "امروز" : "فردا"}</h3>
                       <p className="text-[9px] text-slate-400">آخرین وضعیت سفارش هر مشتری ثابت</p>
                     </div>
                     
@@ -1259,6 +1337,184 @@ export default function App() {
                     title="حذف مخاطب"
                   >
                     <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Manual SMS Entry Modal Sheet */}
+          {showPasteSMSModal && (
+            <div className="absolute inset-0 bg-black/40 z-50 flex flex-col justify-end animate-fadeIn">
+              <div className="bg-white rounded-t-[30px] p-5 max-h-[85%] overflow-y-auto space-y-4 shadow-2xl border-t border-slate-200 transition-transform">
+                <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+                  <div className="flex items-center gap-2">
+                    <MessageSquare className="w-5 h-5 text-blue-600" />
+                    <h4 className="text-xs font-black text-slate-800">ثبت دستی متن پیامک</h4>
+                  </div>
+                  <button
+                    onClick={() => setShowPasteSMSModal(false)}
+                    className="p-1.5 hover:bg-slate-100 rounded-full text-slate-400 hover:text-slate-700 transition-colors"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+
+                <div className="space-y-3.5 text-xs">
+                  <div className="space-y-1">
+                    <label className="text-slate-500 block font-bold">انتخاب مشتری فرستنده:</label>
+                    {customers.length === 0 ? (
+                      <div className="text-[10px] text-red-600 bg-red-50 p-2.5 rounded-xl border border-red-100">
+                        هیچ مشتری ثابتی یافت نشد. ابتدا در بخش مشتریان دستی یا از دفترچه تلفن یکی اضافه کنید.
+                      </div>
+                    ) : (
+                      <select
+                        value={selectedSimSender}
+                        onChange={(e) => setSelectedSimSender(e.target.value)}
+                        className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-xs font-bold text-slate-800 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      >
+                        {customers.map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.name} ({c.phone})
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-slate-500 block font-bold">متن کامل پیامک دریافت شده:</label>
+                    <textarea
+                      placeholder="مثال: سلام اکبر هستم فردا واسه ما زحمت بکشید ۴۵ کیلو شیر بفرستید دستت درد نکنه"
+                      value={simMessageText}
+                      onChange={(e) => setSimMessageText(e.target.value)}
+                      rows={4}
+                      className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500 leading-relaxed text-right"
+                    />
+                  </div>
+
+                  <button
+                    onClick={async () => {
+                      if (customers.length === 0) {
+                        alert("لطفا ابتدا یک مشتری ثبت کنید.");
+                        return;
+                      }
+                      if (!simMessageText.trim()) {
+                        alert("متن پیامک نمی‌تواند خالی باشد.");
+                        return;
+                      }
+                      await handleSimulateSMS(simMessageText, selectedSimSender);
+                      setShowPasteSMSModal(false);
+                    }}
+                    className="w-full bg-blue-600 hover:bg-blue-700 text-white py-2.5 rounded-xl text-xs font-black transition-all shadow-md active:scale-95 flex items-center justify-center gap-1.5"
+                  >
+                    <span>پردازش و ثبت سفارش</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Advanced Settings Modal Sheet */}
+          {showSettingsModal && (
+            <div className="absolute inset-0 bg-black/40 z-50 flex flex-col justify-end animate-fadeIn">
+              <div className="bg-white rounded-t-[30px] p-5 max-h-[85%] overflow-y-auto space-y-4 shadow-2xl border-t border-slate-200 transition-transform">
+                <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+                  <div className="flex items-center gap-2">
+                    <SettingsIcon className="w-5 h-5 text-blue-600" />
+                    <h4 className="text-xs font-black text-slate-800">تنظیمات پیشرفته زمان و شیفت</h4>
+                  </div>
+                  <button
+                    onClick={() => setShowSettingsModal(false)}
+                    className="p-1.5 hover:bg-slate-100 rounded-full text-slate-400 hover:text-slate-700 transition-colors"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+
+                <div className="space-y-4 text-xs">
+                  {/* Cutoff Settings */}
+                  <div className="space-y-2 border-b border-slate-100 pb-3">
+                    <span className="font-bold text-slate-700 block">ساعت نهایی بستن سفارشات (ساعت Cutoff):</span>
+                    <p className="text-[10px] text-slate-400 leading-relaxed">
+                      سفارشاتی که پس از این ساعت دریافت شوند به عنوان سفارش روز پس از فردا در نظر گرفته خواهند شد.
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={settings.cutoffHour}
+                        onChange={(e) => setSettings(prev => ({ ...prev, cutoffHour: parseInt(e.target.value) }))}
+                        className="bg-slate-50 border border-slate-200 rounded-xl p-2 font-black text-center flex-1"
+                      >
+                        {Array.from({ length: 24 }).map((_, i) => (
+                          <option key={i} value={i}>
+                            ساعت {String(i).padStart(2, "0")}
+                          </option>
+                        ))}
+                      </select>
+                      <span className="text-slate-400">:</span>
+                      <select
+                        value={settings.cutoffMinute}
+                        onChange={(e) => setSettings(prev => ({ ...prev, cutoffMinute: parseInt(e.target.value) }))}
+                        className="bg-slate-50 border border-slate-200 rounded-xl p-2 font-black text-center flex-1"
+                      >
+                        {[0, 15, 30, 45].map((m) => (
+                          <option key={m} value={m}>
+                            {String(m).padStart(2, "0")} دقیقه
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Simulated Clock Toggle */}
+                  <div className="space-y-2 pb-2">
+                    <div className="flex justify-between items-center">
+                      <span className="font-bold text-slate-700">تست شیفت شب با ساعت مجازی:</span>
+                      <input
+                        type="checkbox"
+                        checked={useSimulatedClock}
+                        onChange={(e) => setUseSimulatedClock(e.target.checked)}
+                        className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                      />
+                    </div>
+                    
+                    {useSimulatedClock && (
+                      <div className="bg-blue-50/50 p-3 rounded-2xl border border-blue-100 space-y-2 animate-fadeIn">
+                        <span className="text-[10px] text-blue-800 font-bold block">تنظیم ساعت شبیه‌سازی:</span>
+                        <div className="flex items-center gap-2">
+                          <select
+                            value={simulatedHour}
+                            onChange={(e) => setSimulatedHour(parseInt(e.target.value))}
+                            className="bg-white border border-slate-200 rounded-lg p-1.5 font-bold text-center flex-1"
+                          >
+                            {Array.from({ length: 24 }).map((_, i) => (
+                              <option key={i} value={i}>
+                                ساعت {String(i).padStart(2, "0")}
+                              </option>
+                            ))}
+                          </select>
+                          <span className="text-slate-400">:</span>
+                          <select
+                            value={simulatedMinute}
+                            onChange={(e) => setSimulatedMinute(parseInt(e.target.value))}
+                            className="bg-white border border-slate-200 rounded-lg p-1.5 font-bold text-center flex-1"
+                          >
+                            {Array.from({ length: 60 }).map((_, i) => (
+                              <option key={i} value={i}>
+                                {String(i).padStart(2, "0")} دقیقه
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <button
+                    onClick={() => setShowSettingsModal(false)}
+                    className="w-full bg-slate-900 text-white py-2.5 rounded-xl font-bold hover:bg-slate-800 transition-colors"
+                  >
+                    بستن و اعمال تنظیمات
                   </button>
                 </div>
               </div>
