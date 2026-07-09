@@ -1,10 +1,10 @@
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import { loadDatabase, saveDatabase } from "./src/db-store";
 import { Customer, MilkOrder } from "./src/types";
+import { parseMilkMessageLocally } from "./src/localParser";
 
 dotenv.config();
 
@@ -27,82 +27,6 @@ async function startServer() {
   app.use(express.json());
   // Support urlencoded bodies in case some SMS gateways send form-urlencoded instead of JSON
   app.use(express.urlencoded({ extended: true }));
-
-  // Lazy initialization of the Google GenAI SDK
-  let ai: GoogleGenAI | null = null;
-  function getGeminiClient(): GoogleGenAI {
-    if (!ai) {
-      const apiKey = process.env.GEMINI_API_KEY;
-      if (!apiKey) {
-        throw new Error("GEMINI_API_KEY environment variable is not configured. Please set it in the Secrets panel in AI Studio.");
-      }
-      ai = new GoogleGenAI({
-        apiKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          }
-        }
-      });
-    }
-    return ai;
-  }
-
-  // Helper to call Gemini AI and interpret any text
-  async function parseWithGemini(text: string, contactName: string) {
-    const client = getGeminiClient();
-
-    const systemInstruction = `
-      You are an expert system that extracts milk order details from Persian chat messages or SMS received from fixed customers.
-      Your goal is to parse the message and determine the quantity of milk (in kilograms/kg/کیلو) the customer wants for tomorrow (or today, if unspecified).
-      
-      Analyze the text carefully. Persian users use various expressions:
-      - "فردا ۵۰ تا میخوام" or "واسه فردا ۵۰ کیلو" means milk_quantity = 50, is_cancelled = false, is_milk_request = true.
-      - "فردا شیر نمیخوام" or "فردا کنسله" means milk_quantity = 0, is_cancelled = true, is_milk_request = true.
-      - "سلام چطوری" or "پول واریز شد" is NOT a milk request. Set is_milk_request = false, milk_quantity = null, is_cancelled = false.
-      - "۱۰۰ کیلو شیر برای فردا صبح زحمت بکشید" means milk_quantity = 100, is_cancelled = false, is_milk_request = true.
-      
-      Provide the response strictly according to the schema.
-    `;
-
-    const response = await client.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: `پیام مشتری (${contactName}): "${text}"`,
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            milk_quantity: {
-              type: Type.NUMBER,
-              description: "The amount of milk in kg requested. Set to 0 if cancelled or explicitly not wanted. Set to null if not a milk order or unspecified."
-            },
-            is_cancelled: {
-              type: Type.BOOLEAN,
-              description: "True if the user explicitly cancels or says they don't want milk tomorrow (e.g. 'شیر نمیخوام')."
-            },
-            is_milk_request: {
-              type: Type.BOOLEAN,
-              description: "True if the message is a request for milk or a cancellation of milk. False if it is just a greeting, payment confirmation, or unrelated chatter."
-            },
-            explanation: {
-              type: Type.STRING,
-              description: "A short, clear explanation in Persian summarizing what was understood from the text (e.g. 'درخواست ۷۰ کیلو شیر برای فردا')."
-            }
-          },
-          required: ["is_cancelled", "is_milk_request", "explanation"]
-        }
-      }
-    });
-
-    const responseText = response.text;
-    if (!responseText) {
-      throw new Error("پاسخی از هوش مصنوعی دریافت نشد.");
-    }
-
-    return JSON.parse(responseText.trim());
-  }
 
   // --- API Routes for JSON DB ---
 
@@ -138,7 +62,7 @@ async function startServer() {
       if (!text) {
         return res.status(400).json({ error: "پیام ارسالی خالی است" });
       }
-      const result = await parseWithGemini(text, contactName || "نامشخص");
+      const result = parseMilkMessageLocally(text, contactName || "نامشخص");
       res.json(result);
     } catch (error: any) {
       console.error("Error parsing order:", error);
@@ -185,23 +109,23 @@ async function startServer() {
         db.customers.push(matchedCustomer);
       }
 
-      // Interpret using Gemini
-      console.log(`Analyzing SMS from ${matchedCustomer.name} using Gemini 3.5...`);
-      const aiResult = await parseWithGemini(messageText, matchedCustomer.name);
+      // Interpret using our highly optimized local parser (no Gemini required!)
+      console.log(`Analyzing SMS from ${matchedCustomer.name} using secure offline parser...`);
+      const localResult = parseMilkMessageLocally(messageText, matchedCustomer.name);
 
       // Create new MilkOrder
       const now = new Date();
       const newOrder: MilkOrder = {
-        id: "order-" + Date.now(),
+        id: "order-" + Date.now() + Math.random().toString(36).substring(2, 5),
         contactId: matchedCustomer.id,
         contactName: matchedCustomer.name,
         contactPhone: matchedCustomer.phone,
         messageText: messageText,
         receivedAt: now.toISOString(),
-        milkQuantity: aiResult.milk_quantity,
-        isCancelled: !!aiResult.is_cancelled,
-        isMilkRequest: !!aiResult.is_milk_request,
-        explanation: aiResult.explanation || "تفسیر خودکار پس‌زمینه",
+        milkQuantity: localResult.milk_quantity,
+        isCancelled: !!localResult.is_cancelled,
+        isMilkRequest: !!localResult.is_milk_request,
+        explanation: localResult.explanation || "تفسیر خودکار پس‌زمینه",
         parsedSuccessfully: true
       };
 
@@ -213,9 +137,9 @@ async function startServer() {
 
       res.json({
         success: true,
-        status: "پیامک با موفقیت در پس‌زمینه دریافت، تحلیل و ثبت شد.",
+        status: "پیامک با موفقیت در پس‌زمینه دریافت، به روش آفلاین و ایمن تحلیل و ثبت شد.",
         order: newOrder,
-        aiResult
+        aiResult: localResult
       });
     } catch (error: any) {
       console.error("Error in SMS Webhook handler:", error);

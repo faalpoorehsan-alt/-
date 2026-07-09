@@ -175,6 +175,7 @@ export default function App() {
   // --- Active Tab ---
   // "dashboard" | "history" | "customers"
   const [activeTab, setActiveTab] = useState<string>("dashboard");
+  const [dashboardViewMode, setDashboardViewMode] = useState<"list" | "details">("list");
 
   // --- SMS Simulator State ---
   const [selectedSimSender, setSelectedSimSender] = useState<string>(customers[0]?.id || "");
@@ -250,6 +251,7 @@ export default function App() {
         milkQuantity: result.milk_quantity,
         isCancelled: result.is_cancelled,
         isMilkRequest: result.is_milk_request,
+        isIncremental: result.is_incremental,
         explanation: result.explanation,
         parsedSuccessfully: true,
       };
@@ -271,20 +273,98 @@ export default function App() {
     }
   };
 
-  // --- Orders Filtered by Active Delivery Date ---
+  // --- Orders Filtered by Active Delivery Date (Deduplicated, keeping latest per customer) ---
   const activeDeliveryOrders = useMemo(() => {
     // Current display date in comparison format
     const activeDateKey = getStableDateKey(activeDeliveryDate);
 
-    return orders.filter((order) => {
-      // An order's target delivery is 1 day after it's received
+    // 1. Get all requests for this delivery date
+    const matchingRequests = orders.filter((order) => {
       const orderReceivedDate = new Date(order.receivedAt);
       const orderDeliveryDate = getDeliveryDateForOrderReceivedAt(orderReceivedDate);
       const orderDeliveryDateKey = getStableDateKey(orderDeliveryDate);
-
-      // Only show orders that match active display date and are actually milk requests
       return orderDeliveryDateKey === activeDateKey && order.isMilkRequest;
     });
+
+    // 2. Resolve duplicates and cumulative orders per customer chronologically
+    const customerOrdersState: Record<string, {
+      quantity: number;
+      isCancelled: boolean;
+      explanation: string;
+      latestOrder: MilkOrder;
+      history: { q: number | null, isC: boolean, isInc: boolean, text: string }[];
+    }> = {};
+
+    // Sort oldest to newest, so we compute from first request to latest
+    const sortedRequests = [...matchingRequests].sort((a, b) => 
+      new Date(a.receivedAt).getTime() - new Date(b.receivedAt).getTime()
+    );
+
+    for (const order of sortedRequests) {
+      // Group by contactId (or phone if unknown contact)
+      const key = order.contactId || order.contactPhone;
+      
+      if (!customerOrdersState[key]) {
+        customerOrdersState[key] = {
+          quantity: 0,
+          isCancelled: false,
+          explanation: "",
+          latestOrder: order,
+          history: []
+        };
+      }
+      
+      const state = customerOrdersState[key];
+      state.latestOrder = order; // update latest order reference
+      
+      const q = order.milkQuantity ?? 0;
+      
+      if (order.isCancelled) {
+        state.quantity = 0;
+        state.isCancelled = true;
+        state.explanation = "لغو سفارش";
+        state.history.push({ q: 0, isC: true, isInc: false, text: order.messageText });
+      } else if (order.isIncremental) {
+        const prevQ = state.quantity;
+        state.quantity = prevQ + q;
+        state.isCancelled = false;
+        state.explanation = `افزایش سفارش: ${prevQ} + ${q} = ${state.quantity} کیلو`;
+        state.history.push({ q, isC: false, isInc: true, text: order.messageText });
+      } else {
+        state.quantity = q;
+        state.isCancelled = false;
+        state.explanation = `ثبت سفارش جدید: ${q} کیلو`;
+        state.history.push({ q, isC: false, isInc: false, text: order.messageText });
+      }
+    }
+
+    // Construct virtual MilkOrders representing the final active state for each customer
+    const compiledOrders: MilkOrder[] = Object.entries(customerOrdersState).map(([key, state]) => {
+      const latest = state.latestOrder;
+      
+      // Let's build a nice explanation showing the progression if there was history
+      let finalExplanation = latest.explanation;
+      if (state.history.length > 1) {
+        const steps = [...state.history].map(h => {
+          if (h.isC) return "کنسلی";
+          if (h.isInc) return `+${h.q}`;
+          return `${h.q}`;
+        }).join(" 🡰 ");
+        finalExplanation = `مجموع سفارش: ${state.quantity} کیلوگرم (روند: ${steps})`;
+      }
+
+      return {
+        ...latest,
+        milkQuantity: state.isCancelled ? 0 : state.quantity,
+        isCancelled: state.isCancelled,
+        explanation: finalExplanation,
+      };
+    });
+
+    // 3. Return as a list, sorted newest-first for UI presentation
+    return compiledOrders.sort((a, b) => 
+      new Date(b.receivedAt).getTime() - new Date(a.receivedAt).getTime()
+    );
   }, [orders, activeDeliveryDate]);
 
   // --- Calculate total milk needed for active display date ---
@@ -767,8 +847,6 @@ export default function App() {
                     </div>
                   </div>
                 </div>
-
-                {/* 100% Automatic SMS Webhook Integration Guide */}
                 <div className="bg-gradient-to-br from-indigo-50 to-blue-50 border border-blue-200/80 rounded-2xl p-3.5 space-y-2.5 shadow-sm animate-fadeIn">
                   <div className="flex justify-between items-center">
                     <span className="text-[11px] font-black text-indigo-900 flex items-center gap-1.5">
@@ -801,23 +879,48 @@ export default function App() {
                     </span>
                   </div>
 
-                  <div className="bg-white/40 rounded-xl p-2.5 space-y-1.5 text-[9px] text-slate-500">
-                    <p className="font-bold text-slate-700">مراحل راه‌اندازی سریع در ۲ دقیقه:</p>
-                    <ol className="list-decimal list-inside space-y-1 pr-1.5 leading-relaxed">
-                      <li>نصب برنامه رایگان <b>SMS to Webhook</b> یا <b>SMS Forwarder</b> از گوگل‌پلی روی گوشی.</li>
-                      <li>تعریف یک فیلتر ارسال جدید با قرار دادن آدرس وب‌هوک کپی‌شده در بالا و متد <b>POST (JSON)</b>.</li>
-                      <li><b>تمام!</b> پیامک‌های دریافتی گوشی شما در پس‌زمینه خودکار به این وب‌اپلیکیشن ارسال و توسط هوش مصنوعی ثبت و جمع‌بندی می‌شوند.</li>
-                    </ol>
+                  <div className="bg-amber-50 border border-amber-200 rounded-xl p-2.5 text-[9px] text-amber-900 leading-relaxed space-y-1">
+                    <p className="font-black text-amber-950 flex items-center gap-1">
+                      <AlertCircle className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+                      ملاحظه امنیتی بسیار مهم (حفظ حریم خصوصی):
+                    </p>
+                    <p>
+                      برای اینکه پیامک‌های شخصی یا رمز پویا بانکی شما ارسال نشوند، در برنامه <b>SMS to Webhook</b> گوشی، بخش فیلترها (Filters) را باز کرده و فیلتری با شرط <b>«حاوی کلمات: شیر، کیلو، کنسل، نیار»</b> تعریف کنید. با این کار، فقط پیامک‌های سفارش ارسال شده و امنیت اطلاعات شخصی شما ۱۰۰٪ حفظ می‌شود.
+                    </p>
                   </div>
                 </div>
                 
                 {/* Active Deliveries List */}
                 <div className="space-y-2.5">
-                  <div className="flex justify-between items-center">
-                    <h3 className="text-xs font-black text-slate-700">ریز نیاز و جزئیات سفارشات</h3>
-                    <span className="text-[10px] bg-slate-100 text-slate-600 px-2.5 py-1 rounded-full font-bold">
-                      {activeDeliveryOrders.length} سفارش ثبت‌شده
-                    </span>
+                  <div className="flex justify-between items-center border-b border-slate-100 pb-2">
+                    <div>
+                      <h3 className="text-xs font-black text-slate-700">برنامه توزیع شیر فردا</h3>
+                      <p className="text-[9px] text-slate-400">آخرین وضعیت سفارش هر مشتری ثابت</p>
+                    </div>
+                    
+                    {/* View Mode Toggle */}
+                    <div className="bg-slate-100 p-0.5 rounded-lg flex items-center">
+                      <button
+                        onClick={() => setDashboardViewMode("list")}
+                        className={`px-2.5 py-1 rounded-md text-[9px] font-black transition-all ${
+                          dashboardViewMode === "list"
+                            ? "bg-white text-blue-700 shadow-xs"
+                            : "text-slate-500 hover:text-slate-800"
+                        }`}
+                      >
+                        لیست توزیع (خلاصه)
+                      </button>
+                      <button
+                        onClick={() => setDashboardViewMode("details")}
+                        className={`px-2.5 py-1 rounded-md text-[9px] font-black transition-all ${
+                          dashboardViewMode === "details"
+                            ? "bg-white text-blue-700 shadow-xs"
+                            : "text-slate-500 hover:text-slate-800"
+                        }`}
+                      >
+                        جزئیات پیامک‌ها
+                      </button>
+                    </div>
                   </div>
 
                   {activeDeliveryOrders.length === 0 ? (
@@ -832,7 +935,66 @@ export default function App() {
                         </p>
                       </div>
                     </div>
+                  ) : dashboardViewMode === "list" ? (
+                    /* HIGH DENSITY DISTRIBUTION MANIFEST LIST */
+                    <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
+                      <table className="w-full text-right text-[11px] border-collapse">
+                        <thead>
+                          <tr className="bg-slate-50 text-slate-500 font-bold border-b border-slate-200">
+                            <th className="p-2.5 text-center w-8">ردیف</th>
+                            <th className="p-2.5">نام مشتری</th>
+                            <th className="p-2.5 text-center">ساعت سفارش</th>
+                            <th className="p-2.5 text-left pl-3">مقدار (کیلو)</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {activeDeliveryOrders.map((order, index) => (
+                            <tr
+                              key={order.id}
+                              onClick={() => {
+                                const c = customers.find(x => x.id === order.contactId);
+                                if (c) setSelectedDetailCustomer(c);
+                              }}
+                              className={`hover:bg-slate-50/80 cursor-pointer transition-colors ${
+                                order.isCancelled ? "bg-red-50/10 text-slate-400" : ""
+                              }`}
+                            >
+                              <td className="p-2.5 text-center text-slate-400 font-mono font-bold">
+                                {(index + 1).toLocaleString("fa-IR")}
+                              </td>
+                              <td className="p-2.5 font-bold text-slate-800">
+                                <div className="flex items-center gap-1.5">
+                                  <span>{order.contactName}</span>
+                                  {order.isCancelled && (
+                                    <span className="text-[8px] bg-red-100 text-red-700 font-black px-1 rounded">کنسل</span>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="p-2.5 text-center text-slate-500 font-mono">
+                                {formatPersianTime(new Date(order.receivedAt))}
+                              </td>
+                              <td className="p-2.5 text-left pl-3 font-mono">
+                                {order.isCancelled ? (
+                                  <span className="text-red-600 font-bold line-through">۰</span>
+                                ) : (
+                                  <span className="text-slate-900 font-black text-xs">
+                                    {(order.milkQuantity || 0).toLocaleString("fa-IR")}
+                                  </span>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      <div className="bg-slate-50/50 p-2.5 border-t border-slate-200 flex justify-between items-center text-[10px] text-slate-500 font-bold">
+                        <span>مجموع شیر توزیعی:</span>
+                        <span className="text-blue-700 font-black text-xs">
+                          {totalMilkQuantity.toLocaleString("fa-IR")} کیلوگرم
+                        </span>
+                      </div>
+                    </div>
                   ) : (
+                    /* DETAILED CARDS VIEW WITH ORIGINAL SMS TEXT */
                     <div className="space-y-2">
                       {activeDeliveryOrders.map((order) => (
                         <div
@@ -884,7 +1046,7 @@ export default function App() {
                             <p className="line-clamp-1"><strong className="text-slate-600">پیامک:</strong> {order.messageText}</p>
                             <p className="text-blue-600 font-bold flex items-center gap-1">
                               <Sparkles className="w-3 h-3 text-blue-500" />
-                              <span>تعبیر: {order.explanation}</span>
+                              <span>تفسیر: {order.explanation}</span>
                             </p>
                           </div>
                         </div>

@@ -16,6 +16,7 @@ export interface MilkOrder {
   milkQuantity: number | null; // extracted quantity (kg) or null if unrelated
   isCancelled: boolean; // explicitly cancelled?
   isMilkRequest: boolean; // is it related to milk orders?
+  isIncremental?: boolean; // is it an incremental order addition?
   explanation: string; // AI generated summary/description
   parsedSuccessfully: boolean;
 }
