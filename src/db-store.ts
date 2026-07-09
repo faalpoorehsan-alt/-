@@ -23,8 +23,8 @@ export function loadDatabase(): DatabaseSchema {
 
   // Default database initialization
   const defaultDb: DatabaseSchema = {
-    customers: INITIAL_CUSTOMERS,
-    orders: generateMockHistory(INITIAL_CUSTOMERS),
+    customers: [],
+    orders: [],
     settings: { cutoffHour: 20, cutoffMinute: 0 }
   };
   

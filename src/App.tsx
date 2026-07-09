@@ -43,14 +43,12 @@ export default function App() {
   // --- Persistent States ---
   const [customers, setCustomers] = useState<Customer[]>(() => {
     const saved = localStorage.getItem("milk_customers");
-    return saved ? JSON.parse(saved) : INITIAL_CUSTOMERS;
+    return saved ? JSON.parse(saved) : [];
   });
 
   const [orders, setOrders] = useState<MilkOrder[]>(() => {
     const saved = localStorage.getItem("milk_orders");
-    if (saved) return JSON.parse(saved);
-    // Generate some history with the customers
-    return generateMockHistory(INITIAL_CUSTOMERS);
+    return saved ? JSON.parse(saved) : [];
   });
 
   const [settings, setSettings] = useState<AppSettings>(() => {
@@ -60,6 +58,13 @@ export default function App() {
 
   const [isSyncing, setIsSyncing] = useState(false);
 
+  // Keep track of the last state that was loaded/synced to the server to prevent infinite loops
+  const lastServerStateRef = React.useRef({
+    customers: "",
+    orders: "",
+    settings: ""
+  });
+
   // Load from Server on Mount
   useEffect(() => {
     const fetchFromServer = async () => {
@@ -67,74 +72,111 @@ export default function App() {
         const res = await fetch("/api/data");
         if (res.ok) {
           const data = await res.json();
-          if (data.customers) setCustomers(data.customers);
-          if (data.orders) setOrders(data.orders);
-          if (data.settings) setSettings(data.settings);
+          if (data.customers) {
+            lastServerStateRef.current.customers = JSON.stringify(data.customers);
+            setCustomers(data.customers);
+          }
+          if (data.orders) {
+            lastServerStateRef.current.orders = JSON.stringify(data.orders);
+            setOrders(data.orders);
+          }
+          if (data.settings) {
+            lastServerStateRef.current.settings = JSON.stringify(data.settings);
+            setSettings(data.settings);
+          }
         }
       } catch (err) {
-        console.error("Failed to load server data:", err);
+        console.warn("Could not fetch initial database state from server. Operating in offline/local-first mode:", err);
       }
     };
     fetchFromServer();
   }, []);
 
-  // Save to server & localStorage
-  const syncWithServer = async (updatedCusts?: Customer[], updatedOrders?: MilkOrder[], updatedSettings?: AppSettings) => {
-    try {
-      setIsSyncing(true);
-      await fetch("/api/save-state", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          customers: updatedCusts,
-          orders: updatedOrders,
-          settings: updatedSettings
-        })
-      });
-    } catch (err) {
-      console.error("Failed to sync with server:", err);
-    } finally {
-      setIsSyncing(false);
-    }
-  };
-
+  // Save to server & localStorage in a unified, debounced way to avoid race conditions
   useEffect(() => {
+    // 1. Always update local storage
     localStorage.setItem("milk_customers", JSON.stringify(customers));
-    syncWithServer(customers, undefined, undefined);
-  }, [customers]);
-
-  useEffect(() => {
     localStorage.setItem("milk_orders", JSON.stringify(orders));
-    syncWithServer(undefined, orders, undefined);
-  }, [orders]);
-
-  useEffect(() => {
     localStorage.setItem("milk_settings", JSON.stringify(settings));
-    syncWithServer(undefined, undefined, settings);
-  }, [settings]);
+
+    // 2. Check if local state is actually mutated from what we last loaded/sent
+    const currentCustStr = JSON.stringify(customers);
+    const currentOrdStr = JSON.stringify(orders);
+    const currentSetStr = JSON.stringify(settings);
+
+    const isCustChanged = currentCustStr !== lastServerStateRef.current.customers;
+    const isOrdChanged = currentOrdStr !== lastServerStateRef.current.orders;
+    const isSetChanged = currentSetStr !== lastServerStateRef.current.settings;
+
+    if (isCustChanged || isOrdChanged || isSetChanged) {
+      const timer = setTimeout(async () => {
+        try {
+          setIsSyncing(true);
+          await fetch("/api/save-state", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              customers: isCustChanged ? customers : undefined,
+              orders: isOrdChanged ? orders : undefined,
+              settings: isSetChanged ? settings : undefined
+            })
+          });
+          // Update the references to reflect the successfully saved state
+          lastServerStateRef.current.customers = currentCustStr;
+          lastServerStateRef.current.orders = currentOrdStr;
+          lastServerStateRef.current.settings = currentSetStr;
+        } catch (err) {
+          console.warn("Failed to sync local changes with server:", err);
+        } finally {
+          setIsSyncing(false);
+        }
+      }, 1000);
+
+      return () => clearTimeout(timer);
+    }
+  }, [customers, orders, settings]);
 
   // Polling for new background SMS orders every 5 seconds
   useEffect(() => {
+    let active = true;
     const interval = setInterval(async () => {
       try {
         const res = await fetch("/api/data");
-        if (res.ok) {
+        if (res.ok && active) {
           const data = await res.json();
-          if (JSON.stringify(data.customers) !== JSON.stringify(customers)) {
+          
+          const serverCustStr = JSON.stringify(data.customers || []);
+          const serverOrdStr = JSON.stringify(data.orders || []);
+          const serverSetStr = JSON.stringify(data.settings || {});
+
+          const localCustStr = JSON.stringify(customers);
+          const localOrdStr = JSON.stringify(orders);
+          const localSetStr = JSON.stringify(settings);
+
+          // Update only if server differs from our last state, AND we haven't mutated it differently locally
+          if (serverCustStr !== lastServerStateRef.current.customers && serverCustStr !== localCustStr) {
+            lastServerStateRef.current.customers = serverCustStr;
             setCustomers(data.customers);
           }
-          if (JSON.stringify(data.orders) !== JSON.stringify(orders)) {
+          if (serverOrdStr !== lastServerStateRef.current.orders && serverOrdStr !== localOrdStr) {
+            lastServerStateRef.current.orders = serverOrdStr;
             setOrders(data.orders);
           }
-          if (JSON.stringify(data.settings) !== JSON.stringify(settings)) {
+          if (serverSetStr !== lastServerStateRef.current.settings && serverSetStr !== localSetStr) {
+            lastServerStateRef.current.settings = serverSetStr;
             setSettings(data.settings);
           }
         }
       } catch (err) {
-        console.error("Error polling database updates:", err);
+        // Polling failed (e.g. temporary offline/rebuilding state). Quiet log to prevent console spam.
+        console.log("Database sync check deferred: Network unavailable or connection paused.");
       }
     }, 5000);
-    return () => clearInterval(interval);
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
   }, [customers, orders, settings]);
 
   // --- Simulated Clock for Testing ---
@@ -198,6 +240,10 @@ export default function App() {
   const [newCustPhone, setNewCustPhone] = useState("");
   const [newCustAlias, setNewCustAlias] = useState("");
   const [showAddCustomerModal, setShowAddCustomerModal] = useState(false);
+
+  // --- Cleaner UI Modals ---
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [showPasteSMSModal, setShowPasteSMSModal] = useState(false);
 
   // Auto-set simulator values
   useEffect(() => {
@@ -418,7 +464,28 @@ export default function App() {
       setOrders(generateMockHistory(INITIAL_CUSTOMERS));
       setSettings({ cutoffHour: 20, cutoffMinute: 0 });
       setUseSimulatedClock(false);
+      lastServerStateRef.current = {
+        customers: "",
+        orders: "",
+        settings: ""
+      };
       addSimLog("کل سیستم به داده‌های نمونه اولیه ریست شد.");
+    }
+  };
+
+  // --- Wipe entire database ---
+  const handleClearDatabase = () => {
+    if (window.confirm("⚠️ آیا از حذف کل داده‌های مشتریان و کل تاریخچه سفارشات اطمینان دارید؟ این عمل غیرقابل بازگشت است.")) {
+      setCustomers([]);
+      setOrders([]);
+      localStorage.removeItem("milk_customers");
+      localStorage.removeItem("milk_orders");
+      lastServerStateRef.current = {
+        customers: "[]",
+        orders: "[]",
+        settings: JSON.stringify(settings)
+      };
+      addSimLog("کل پایگاه داده سیستم پاکسازی و خالی شد.");
     }
   };
 
@@ -505,202 +572,17 @@ export default function App() {
   }, [orders, historySearch, selectedHistoryCustomer]);
 
   return (
-    <div id="main-app" className="min-h-screen bg-[#eceff1] flex flex-col md:flex-row p-0 md:p-6 lg:p-8 justify-center items-center font-sans gap-6 select-none overflow-x-hidden">
+    <div id="main-app" className="min-h-screen bg-[#eceff1] flex flex-col p-0 lg:p-6 justify-center items-center font-sans select-none overflow-x-hidden">
       
       {/* 
         ========================================================================
-        RIGHT COLUMN: SMS & AI INTERPRETATION SIMULATOR PANEL (بخش شبیه‌ساز)
+        PRODUCTION MOBILE INTERFACE (CENTRAL DEVICE STAGE)
         ========================================================================
       */}
-      <div className="w-full md:w-[480px] lg:w-[500px] bg-white rounded-3xl border border-slate-200 shadow-xl flex flex-col overflow-hidden max-h-[850px]">
-        <div className="bg-slate-900 text-white p-5 flex items-center justify-between border-b border-slate-800">
-          <div className="flex items-center gap-2.5">
-            <div className="w-9 h-9 bg-blue-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-blue-500/20">
-              <Sparkles className="w-5 h-5 text-blue-100" />
-            </div>
-            <div>
-              <h2 className="text-sm font-bold text-slate-100">درگاه شبیه‌ساز پیامک و هوش مصنوعی</h2>
-              <p className="text-[10px] text-slate-400">ارسال پیامک و بررسی نحوه تفسیر با Gemini 3.5</p>
-            </div>
-          </div>
-          <button
-            onClick={handleResetToPresets}
-            title="بازیابی داده‌های پیش‌فرض"
-            className="p-1.5 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition-colors"
-          >
-            <RefreshCw className="w-4 h-4" />
-          </button>
-        </div>
-
-        <div className="p-5 flex-1 overflow-y-auto space-y-5">
-          {/* Instructions */}
-          <div className="bg-blue-50/70 rounded-2xl p-4 border border-blue-100/50 flex gap-3 text-right">
-            <Info className="w-5 h-5 text-blue-600 shrink-0 mt-0.5" />
-            <div className="space-y-1">
-              <h4 className="text-xs font-bold text-blue-900">چگونه برنامه را تست کنیم؟</h4>
-              <p className="text-[11px] leading-relaxed text-blue-800">
-                از بخش زیر، یکی از مخاطبین را انتخاب کنید و پیامکی آزمایشی با زبان عامیانه بنویسید (یا از قالب‌های آماده استفاده کنید). پس از کلیک روی دکمه ارسال، پیامک توسط هوش مصنوعی پردازش شده و به سفارش‌های روزانه افزوده می‌شود.
-              </p>
-            </div>
-          </div>
-
-          {/* Quick Templates Slider */}
-          <div>
-            <div className="flex justify-between items-center mb-2">
-              <label className="text-xs font-bold text-slate-500">قالب‌های آماده پیامک سفارش:</label>
-              <span className="text-[10px] bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded-full font-medium">هوشمند فارسی</span>
-            </div>
-            <div className="grid grid-cols-1 gap-2 max-h-[220px] overflow-y-auto pr-1">
-              {PERS_TEMPLATES.map((tpl, idx) => {
-                const matchedContact = customers.find(c => c.phone === tpl.phone);
-                return (
-                  <button
-                    key={idx}
-                    onClick={() => {
-                      if (matchedContact) {
-                        setSelectedSimSender(matchedContact.id);
-                      }
-                      setSimMessageText(tpl.text);
-                    }}
-                    className="p-2.5 text-right bg-slate-50 hover:bg-indigo-50/40 hover:border-indigo-200 rounded-xl border border-slate-200/60 transition-all text-xs flex flex-col gap-1 active:scale-[0.98]"
-                  >
-                    <div className="flex justify-between items-center w-full">
-                      <span className="font-bold text-slate-700">{tpl.senderName}</span>
-                      <span className="text-[10px] text-slate-400 bg-white px-2 py-0.5 rounded-md border border-slate-100">{tpl.phone}</span>
-                    </div>
-                    <p className="text-slate-600 font-mono text-[11px] truncate w-full">{tpl.text}</p>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          <hr className="border-slate-100" />
-
-          {/* Custom SMS Generator */}
-          <div className="space-y-3">
-            <div>
-              <label className="block text-xs font-bold text-slate-500 mb-1.5">فرستنده پیامک شبیه‌سازی‌شده:</label>
-              {customers.length === 0 ? (
-                <div className="text-xs text-red-600 bg-red-50 p-3 rounded-xl border border-red-100 flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4" />
-                  هیچ مشتری ثابتی وجود ندارد! ابتدا در بخش مشتریان یک مخاطب بسازید.
-                </div>
-              ) : (
-                <select
-                  value={selectedSimSender}
-                  onChange={(e) => setSelectedSimSender(e.target.value)}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-xs font-bold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  {customers.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name} ({c.phone})
-                    </option>
-                  ))}
-                </select>
-              )}
-            </div>
-
-            <div>
-              <label className="block text-xs font-bold text-slate-500 mb-1.5">متن پیامک ارسالی:</label>
-              <textarea
-                value={simMessageText}
-                onChange={(e) => setSimMessageText(e.target.value)}
-                placeholder="مثال: سلام خسته نباشید واسه فردا ۵۰ کیلو شیر زحمت بکشید..."
-                rows={3}
-                className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-right leading-relaxed"
-              />
-            </div>
-
-            <button
-              onClick={() => handleSimulateSMS()}
-              disabled={isParsing || customers.length === 0}
-              className={`w-full py-3 px-4 rounded-xl text-white text-xs font-bold transition-all flex items-center justify-center gap-2 ${
-                isParsing 
-                  ? "bg-blue-400 cursor-not-allowed" 
-                  : "bg-blue-600 hover:bg-blue-700 shadow-lg shadow-blue-500/20 hover:shadow-blue-500/30 active:scale-95"
-              }`}
-            >
-              {isParsing ? (
-                <>
-                  <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
-                  <span>هوش مصنوعی در حال تفسیر پیام...</span>
-                </>
-              ) : (
-                <>
-                  <Send className="w-4 h-4 rotate-180" />
-                  <span>ارسال پیامک شبیه‌سازی‌شده به گوشی</span>
-                </>
-              )}
-            </button>
-
-            {parsingError && (
-              <div className="bg-red-50 text-red-700 p-3 rounded-xl border border-red-100 text-xs flex items-center gap-2 font-medium">
-                <AlertCircle className="w-4 h-4 shrink-0" />
-                <span>{parsingError}</span>
-              </div>
-            )}
-          </div>
-
-          {/* Parsed Result Showcase */}
-          {lastParsedResult && (
-            <div className="bg-emerald-50/50 border border-emerald-200/60 rounded-2xl p-4 space-y-2.5 animate-fadeIn">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-black text-emerald-800 flex items-center gap-1.5">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                  نتیجه تحلیل زنده Gemini:
-                </span>
-                <span className="text-[9px] bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full font-mono">200 OK</span>
-              </div>
-              <div className="grid grid-cols-2 gap-2 text-xs">
-                <div className="bg-white p-2.5 rounded-xl border border-emerald-100">
-                  <p className="text-[10px] text-slate-400">میزان شیر استخراج شده</p>
-                  <p className="font-black text-slate-900 mt-0.5">
-                    {lastParsedResult.milk_quantity !== null ? `${lastParsedResult.milk_quantity} کیلوگرم` : "نامشخص / غیرمرتبط"}
-                  </p>
-                </div>
-                <div className="bg-white p-2.5 rounded-xl border border-emerald-100">
-                  <p className="text-[10px] text-slate-400">وضعیت لغو سفارش</p>
-                  <p className="font-bold mt-0.5">
-                    {lastParsedResult.is_cancelled ? (
-                      <span className="text-red-600">بله (کنسل شده)</span>
-                    ) : (
-                      <span className="text-emerald-600">خیر</span>
-                    )}
-                  </p>
-                </div>
-              </div>
-              <div className="bg-white p-2.5 rounded-xl border border-emerald-100 text-xs text-slate-700 leading-relaxed">
-                <span className="font-bold text-slate-800">توضیح هوش مصنوعی:</span> {lastParsedResult.explanation}
-              </div>
-            </div>
-          )}
-
-          {/* System Logs */}
-          <div className="space-y-2">
-            <span className="text-xs font-bold text-slate-400 block">لاگ وقایع دریافت پیامک (زنده):</span>
-            <div className="bg-slate-900 text-slate-300 p-3 rounded-xl font-mono text-[10px] h-[130px] overflow-y-auto space-y-1.5">
-              {simulationLogs.length === 0 ? (
-                <p className="text-slate-500 italic text-center pt-8">پیامی ارسال نشده است...</p>
-              ) : (
-                simulationLogs.map((log, idx) => (
-                  <p key={idx} className="truncate">{log}</p>
-                ))
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* 
-        ========================================================================
-        LEFT COLUMN: ANDROID MOBILE INTERFACE SIMULATOR
-        ========================================================================
-      */}
-      <div id="android-device" className="relative bg-slate-950 p-4 pb-14 pt-12 rounded-[50px] shadow-[0_25px_60px_-15px_rgba(0,0,0,0.4)] border-4 border-slate-800 w-full max-w-[450px] aspect-[9/19] h-[850px] flex flex-col overflow-hidden">
+      <div id="android-device" className="w-full h-screen lg:h-[850px] lg:max-w-[450px] lg:aspect-[9/19] lg:relative lg:bg-slate-950 lg:p-4 lg:pb-14 lg:pt-12 lg:rounded-[50px] lg:shadow-[0_25px_60px_-15px_rgba(0,0,0,0.4)] lg:border-4 lg:border-slate-800 flex flex-col overflow-hidden bg-slate-50">
         
         {/* Speaker Bezel */}
-        <div className="absolute top-4 left-1/2 transform -translate-x-1/2 w-32 h-5 bg-slate-900 rounded-full flex items-center justify-center gap-1.5 z-50">
+        <div className="hidden lg:flex absolute top-4 left-1/2 transform -translate-x-1/2 w-32 h-5 bg-slate-900 rounded-full items-center justify-center gap-1.5 z-50">
           <div className="w-12 h-1 bg-slate-700 rounded-full"></div>
           <div className="w-2.5 h-2.5 bg-slate-800 rounded-full border border-slate-700"></div>
         </div>
@@ -718,7 +600,7 @@ export default function App() {
         </div>
 
         {/* Device Interface */}
-        <div className="flex-1 bg-slate-50 flex flex-col overflow-hidden relative rounded-2xl">
+        <div className="flex-1 bg-slate-50 flex flex-col overflow-hidden relative lg:rounded-2xl">
           
           {/* Active Date & Reporting Header */}
           <header className="bg-white border-b border-slate-200 p-4 shadow-sm shrink-0 flex flex-col gap-2.5">
@@ -757,138 +639,51 @@ export default function App() {
                   {formatPersianDateFull(activeDeliveryDate)}
                 </p>
               </div>
-              <div className="bg-blue-50 text-blue-800 border border-blue-100 rounded-xl px-2.5 py-1 text-[10px] font-bold text-center">
-                تاریخ سفارش: {formatPersianDateShort(currentAppTime)}
+              <div className="flex flex-col items-end gap-1.5 shrink-0">
+                <div className="bg-blue-50 text-blue-800 border border-blue-100 rounded-xl px-2.5 py-1 text-[10px] font-bold text-center">
+                  تاریخ سفارش: {formatPersianDateShort(currentAppTime)}
+                </div>
+                <div className="flex gap-1.5">
+                  <button
+                    onClick={() => setShowPasteSMSModal(true)}
+                    className="bg-slate-100 hover:bg-blue-50 hover:text-blue-600 text-slate-600 p-1.5 rounded-lg border border-slate-200/60 transition-all flex items-center gap-1 text-[9px] font-black"
+                    title="ثبت دستی متن پیامک"
+                  >
+                    <MessageSquare className="w-3 h-3" />
+                    <span>ثبت پیامک</span>
+                  </button>
+                  <button
+                    onClick={() => setShowSettingsModal(true)}
+                    className="bg-slate-100 hover:bg-blue-50 hover:text-blue-600 text-slate-600 p-1.5 rounded-lg border border-slate-200/60 transition-all flex items-center gap-1 text-[9px] font-black"
+                    title="تنظیمات پیشرفته"
+                  >
+                    <SettingsIcon className="w-3 h-3" />
+                    <span>تنظیمات</span>
+                  </button>
+                </div>
               </div>
             </div>
-
+          </header>
+          
+          {/* Scrollable Screen Content */}
+          <div className="flex-1 overflow-y-auto p-4 space-y-4">
+            
             {/* Total Indicator Panel */}
-            <div className="bg-gradient-to-r from-blue-600 to-indigo-600 text-white rounded-2xl p-3 flex justify-between items-center shadow-md">
+            <div className="bg-gradient-to-r from-blue-600 to-indigo-600 text-white rounded-2xl p-3 flex justify-between items-center shadow-md animate-fadeIn">
               <div className="space-y-0.5">
                 <span className="text-[10px] text-blue-100 font-bold block">مجموع کل شیر مورد نیاز فردا</span>
-                <div className="text-2xl font-black flex items-baseline gap-1">
-                  <span>{totalMilkQuantity.toLocaleString("fa-IR")}</span>
-                  <span className="text-xs font-medium">کیلوگرم</span>
-                </div>
+                <p className="text-xl font-black">
+                  {totalMilkQuantity.toLocaleString("fa-IR")} <span className="text-xs font-normal">کیلوگرم</span>
+                </p>
               </div>
               <div className="w-10 h-10 bg-white/10 rounded-xl flex items-center justify-center">
                 <Layers className="w-5 h-5 text-white" />
               </div>
             </div>
 
-            {/* Shift Banner & Shift Setting Indicator */}
-            <div className="flex items-center justify-between bg-amber-50 border border-amber-100 rounded-xl px-3 py-2 text-[10px] text-amber-900 font-medium">
-              <div className="flex items-center gap-1.5">
-                <span className="w-1.5 h-1.5 bg-amber-500 rounded-full animate-ping"></span>
-                <span>
-                  {isPastCutoff 
-                    ? `ساعت کاری روز پایان یافته. نمایش سفارشات فردا` 
-                    : `ساعت کاری روز در جریان است. سفارشات فعال امروز`
-                  }
-                </span>
-              </div>
-              <span className="bg-white text-amber-800 border border-amber-200 px-1.5 py-0.5 rounded font-bold">
-                تغییر شیفت: {settings.cutoffHour}:00
-              </span>
-            </div>
-          </header>
-
-          {/* 
-            ========================================================================
-            SCREEN CONTENT VIEWER
-            ========================================================================
-          */}
-          <div className="flex-1 overflow-y-auto p-4 space-y-4">
-            
             {/* 1. DASHBOARD VIEW */}
             {activeTab === "dashboard" && (
               <div className="space-y-4 animate-fadeIn">
-                
-                {/* Mobile SMS Fast-Register Box */}
-                <div className="bg-slate-900 text-white rounded-2xl p-3.5 space-y-2.5 shadow-md">
-                  <div className="flex justify-between items-center">
-                    <span className="text-[10px] font-bold text-blue-400 flex items-center gap-1.5">
-                      <MessageSquare className="w-4 h-4 text-blue-500" />
-                      ثبت سریع متن پیامک کپی‌شده
-                    </span>
-                    <span className="text-[9px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-md font-mono">طرح اندروید</span>
-                  </div>
-                  <div className="space-y-2">
-                    <textarea
-                      placeholder="پیامک دریافتی از مشتری را در این کادر پیست (Paste) کنید..."
-                      value={simMessageText}
-                      onChange={(e) => setSimMessageText(e.target.value)}
-                      rows={2}
-                      className="w-full bg-slate-800 border border-slate-700 rounded-xl p-2.5 text-[11px] leading-relaxed text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 text-right resize-none"
-                    />
-                    <div className="flex gap-2">
-                      <select
-                        value={selectedSimSender}
-                        onChange={(e) => setSelectedSimSender(e.target.value)}
-                        className="bg-slate-800 border border-slate-700 rounded-xl text-[10px] px-2 py-2 font-bold text-slate-200 focus:outline-none flex-1"
-                      >
-                        {customers.map((c) => (
-                          <option key={c.id} value={c.id}>
-                            {c.name}
-                          </option>
-                        ))}
-                      </select>
-                      <button
-                        onClick={() => handleSimulateSMS()}
-                        disabled={isParsing || !simMessageText.trim() || customers.length === 0}
-                        className={`px-3 py-2 rounded-xl text-[10px] font-bold text-white flex items-center gap-1 transition-all ${
-                          isParsing || !simMessageText.trim()
-                            ? "bg-slate-800 text-slate-500 cursor-not-allowed"
-                            : "bg-blue-600 hover:bg-blue-700 active:scale-95"
-                        }`}
-                      >
-                        {isParsing ? "در حال تحلیل..." : "تفسیر و ثبت"}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-                <div className="bg-gradient-to-br from-indigo-50 to-blue-50 border border-blue-200/80 rounded-2xl p-3.5 space-y-2.5 shadow-sm animate-fadeIn">
-                  <div className="flex justify-between items-center">
-                    <span className="text-[11px] font-black text-indigo-900 flex items-center gap-1.5">
-                      <Sparkles className="w-4 h-4 text-indigo-600 animate-pulse" />
-                      اتوماسیون ۱۰۰٪ بدون دخالت دست (وب‌هوک)
-                    </span>
-                    <span className="flex items-center gap-1">
-                      <span className="w-1.5 h-1.5 bg-green-500 rounded-full animate-ping"></span>
-                      <span className="text-[9px] text-green-700 font-black">وب‌هوک پس‌زمینه فعال</span>
-                    </span>
-                  </div>
-                  
-                  <p className="text-[10px] leading-relaxed text-slate-600 text-right">
-                    برای اینکه وقتی <b>خواب هستید</b> یا برنامه بسته است، پیامک‌های مشتری خودکار دریافت و تحلیل شوند، کافیست یک اپلیکیشن رایگان ارسال پیامک به وب‌هوک (مانند <span className="font-bold text-indigo-800">SMS to Webhook</span>) روی گوشی اندروید خود نصب کنید و این آدرس را در آن ست کنید:
-                  </p>
-
-                  <div className="bg-white border border-slate-200 rounded-xl p-2 flex items-center justify-between gap-2">
-                    <button
-                      onClick={() => {
-                        const url = window.location.origin + "/api/incoming-sms";
-                        navigator.clipboard.writeText(url);
-                        alert("آدرس وب‌هوک اختصاصی شما کپی شد:\n" + url);
-                      }}
-                      className="bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white px-2.5 py-1 rounded-lg text-[9px] font-black transition-all shrink-0"
-                    >
-                      کپی آدرس
-                    </button>
-                    <span className="text-[9.5px] font-mono text-slate-500 truncate text-left select-all flex-1" dir="ltr">
-                      {window.location.origin}/api/incoming-sms
-                    </span>
-                  </div>
-
-                  <div className="bg-amber-50 border border-amber-200 rounded-xl p-2.5 text-[9px] text-amber-900 leading-relaxed space-y-1">
-                    <p className="font-black text-amber-950 flex items-center gap-1">
-                      <AlertCircle className="w-3.5 h-3.5 text-amber-700 shrink-0" />
-                      ملاحظه امنیتی بسیار مهم (حفظ حریم خصوصی):
-                    </p>
-                    <p>
-                      برای اینکه پیامک‌های شخصی یا رمز پویا بانکی شما ارسال نشوند، در برنامه <b>SMS to Webhook</b> گوشی، بخش فیلترها (Filters) را باز کرده و فیلتری با شرط <b>«حاوی کلمات: شیر، کیلو، کنسل، نیار»</b> تعریف کنید. با این کار، فقط پیامک‌های سفارش ارسال شده و امنیت اطلاعات شخصی شما ۱۰۰٪ حفظ می‌شود.
-                    </p>
-                  </div>
-                </div>
                 
                 {/* Active Deliveries List */}
                 <div className="space-y-2.5">
@@ -1117,6 +912,26 @@ export default function App() {
                           </span>
                         </div>
                       )}
+                    </div>
+
+                    {/* Database Management Tools */}
+                    <div className="border-t border-slate-150 pt-3 mt-3 space-y-2">
+                      <p className="font-bold text-slate-700">مدیریت پایگاه داده و اطلاعات مشتریان</p>
+                      <p className="text-[9px] text-slate-400 leading-relaxed">جهت پاکسازی کل مشتریان و سفارشات فرضی نمونه برای شروع کار با داده‌های واقعی خودتان</p>
+                      <div className="flex gap-2 pt-1">
+                        <button
+                          onClick={handleClearDatabase}
+                          className="flex-1 bg-red-50 hover:bg-red-100 text-red-600 border border-red-100 py-2 rounded-xl font-bold text-[10px] transition-colors"
+                        >
+                          پاکسازی کامل داده‌ها
+                        </button>
+                        <button
+                          onClick={handleResetToPresets}
+                          className="flex-1 bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200/60 py-2 rounded-xl font-bold text-[10px] transition-colors"
+                        >
+                          بازیابی داده‌های فرضی نمونه
+                        </button>
+                      </div>
                     </div>
                   </div>
                 </div>

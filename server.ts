@@ -125,6 +125,7 @@ async function startServer() {
         milkQuantity: localResult.milk_quantity,
         isCancelled: !!localResult.is_cancelled,
         isMilkRequest: !!localResult.is_milk_request,
+        isIncremental: !!localResult.is_incremental,
         explanation: localResult.explanation || "تفسیر خودکار پس‌زمینه",
         parsedSuccessfully: true
       };
