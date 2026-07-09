@@ -1,0 +1,6 @@
+{
+  "name": "مدیریت سفارشات شیر",
+  "description": "سیستم هوشمند مدیریت مشتریان ثابت و تفسیر خودکار پیامک‌های سفارش شیر با هوش مصنوعی جمینی و ثبت هیستوری روزانه",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
