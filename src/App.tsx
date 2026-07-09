@@ -24,7 +24,8 @@ import {
   Smartphone,
   Send,
   Calendar,
-  Layers
+  Layers,
+  Edit2
 } from "lucide-react";
 import { Customer, MilkOrder, AppSettings, DeliveryRecord } from "./types";
 import { INITIAL_CUSTOMERS, PERS_TEMPLATES, generateMockHistory } from "./data";
@@ -256,15 +257,15 @@ export default function App() {
   // --- Active Tab ---
   // "dashboard" | "history" | "customers"
   const [activeTab, setActiveTab] = useState<string>("dashboard");
-  const [dashboardViewMode, setDashboardViewMode] = useState<"list" | "details">("list");
 
-  // --- SMS Simulator State ---
-  const [selectedSimSender, setSelectedSimSender] = useState<string>(customers[0]?.id || "");
-  const [simMessageText, setSimMessageText] = useState<string>("");
+  // --- Manual Bookkeeper Order Form State ---
+  const [showOrderFormModal, setShowOrderFormModal] = useState(false);
+  const [orderFormContactId, setOrderFormContactId] = useState("");
+  const [orderFormQuantity, setOrderFormQuantity] = useState<number | "">("");
+  const [orderFormDateKey, setOrderFormDateKey] = useState<string>("");
+
   const [isParsing, setIsParsing] = useState<boolean>(false);
-  const [parsingError, setParsingError] = useState<string | null>(null);
   const [simulationLogs, setSimulationLogs] = useState<string[]>([]);
-  const [lastParsedResult, setLastParsedResult] = useState<any | null>(null);
 
   // --- Search & Filters ---
   const [historySearch, setHistorySearch] = useState<string>("");
@@ -282,80 +283,104 @@ export default function App() {
 
   // --- Cleaner UI Modals ---
   const [showSettingsModal, setShowSettingsModal] = useState(false);
-  const [showPasteSMSModal, setShowPasteSMSModal] = useState(false);
-
-  // Auto-set simulator values
-  useEffect(() => {
-    if (customers.length > 0 && !selectedSimSender) {
-      setSelectedSimSender(customers[0].id);
-    }
-  }, [customers, selectedSimSender]);
 
   // Add notification log
   const addSimLog = (msg: string) => {
     setSimulationLogs((prev) => [`[${formatPersianTime(new Date())}] ${msg}`, ...prev.slice(0, 19)]);
   };
 
-  // --- 100% Offline Local Parser (No Server/API required) ---
-  const handleSimulateSMS = async (overrideText?: string, overrideContactId?: string) => {
-    const contactId = overrideContactId || selectedSimSender;
-    const textToParse = overrideText || simMessageText;
+  // --- Search & Fetch Customer last order details ---
+  const lastOrderForForm = useMemo(() => {
+    if (!orderFormContactId) return null;
+    const customerOrders = orders
+      .filter((o) => o.contactId === orderFormContactId && !o.isCancelled && o.isMilkRequest)
+      .sort((a, b) => new Date(b.receivedAt).getTime() - new Date(a.receivedAt).getTime());
+    
+    // We want the latest order NOT on the selected date key
+    return customerOrders.find(o => {
+      const orderDateKey = getStableDateKey(getDeliveryDateForOrderReceivedAt(new Date(o.receivedAt), settings.cutoffHour, settings.cutoffMinute));
+      return orderDateKey !== orderFormDateKey;
+    }) || customerOrders[0] || null;
+  }, [orderFormContactId, orders, orderFormDateKey, settings]);
 
-    const contact = customers.find((c) => c.id === contactId);
-    if (!contact) {
-      setParsingError("لطفاً ابتدا یک مخاطب را انتخاب کنید.");
+  const existingOrderForSelected = useMemo(() => {
+    if (!orderFormContactId || !orderFormDateKey) return null;
+    return orders.find((o) => {
+      const orderDateKey = getStableDateKey(getDeliveryDateForOrderReceivedAt(new Date(o.receivedAt), settings.cutoffHour, settings.cutoffMinute));
+      return o.contactId === orderFormContactId && orderDateKey === orderFormDateKey && !o.isCancelled && o.isMilkRequest;
+    });
+  }, [orderFormContactId, orderFormDateKey, orders, settings]);
+
+  // Auto-fill quantity when existing order is found
+  useEffect(() => {
+    if (existingOrderForSelected) {
+      setOrderFormQuantity(existingOrderForSelected.milkQuantity || "");
+    } else {
+      setOrderFormQuantity("");
+    }
+  }, [existingOrderForSelected]);
+
+  // --- Save / Update manual order ---
+  const handleSaveOrderForm = () => {
+    if (!orderFormContactId) {
+      alert("لطفاً یک مشتری را انتخاب کنید.");
+      return;
+    }
+    if (orderFormQuantity === "" || Number(orderFormQuantity) <= 0) {
+      alert("لطفاً مقدار معتبری وارد کنید.");
       return;
     }
 
-    if (!textToParse.trim()) {
-      setParsingError("متن پیامک نمی‌تواند خالی باشد.");
-      return;
-    }
+    const contact = customers.find((c) => c.id === orderFormContactId);
+    if (!contact) return;
 
-    setIsParsing(true);
-    setParsingError(null);
-    setLastParsedResult(null);
-    addSimLog(`در حال تفسیر آفلاین پیامک از ${contact.name}...`);
+    // We construct a receivedAt timestamp so it naturally resolves to orderFormDateKey
+    const parts = orderFormDateKey.split("-");
+    const year = parseInt(parts[0]);
+    const month = parseInt(parts[1]) - 1;
+    const day = parseInt(parts[2]);
+    
+    const deliveryDate = new Date(year, month, day);
+    const receivedDate = new Date(deliveryDate);
+    receivedDate.setDate(receivedDate.getDate() - 1);
+    receivedDate.setHours(12, 0, 0, 0);
 
-    // Simulate a ultra-fast local processing latency of 150ms for elegant UI feedback
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    const finalReceivedAt = receivedDate.toISOString();
 
-    try {
-      const result = parseMilkMessageLocally(textToParse, contact.name);
-      
-      const now = new Date(currentAppTime);
-      const deliveryDate = getDeliveryDateForOrderReceivedAt(now, settings.cutoffHour, settings.cutoffMinute);
-
+    if (existingOrderForSelected) {
+      setOrders((prev) =>
+        prev.map((o) =>
+          o.id === existingOrderForSelected.id
+            ? {
+                ...o,
+                milkQuantity: Number(orderFormQuantity),
+                explanation: `ثبت دستی: ${orderFormQuantity} کیلو`,
+                receivedAt: finalReceivedAt,
+              }
+            : o
+        )
+      );
+      addSimLog(`سفارش ${contact.name} به مقدار ${orderFormQuantity} کیلوگرم بروزرسانی شد.`);
+    } else {
       const newOrder: MilkOrder = {
         id: "order-" + Date.now() + Math.random().toString(36).substring(2, 5),
         contactId: contact.id,
         contactName: contact.name,
         contactPhone: contact.phone,
-        messageText: textToParse,
-        receivedAt: now.toISOString(),
-        milkQuantity: result.milk_quantity,
-        isCancelled: result.is_cancelled,
-        isMilkRequest: result.is_milk_request,
-        isIncremental: result.is_incremental,
-        explanation: result.explanation,
+        messageText: "ثبت دستی توسط حسابدار",
+        receivedAt: finalReceivedAt,
+        milkQuantity: Number(orderFormQuantity),
+        isCancelled: false,
+        isMilkRequest: true,
+        explanation: `ثبت دستی: ${orderFormQuantity} کیلو`,
         parsedSuccessfully: true,
       };
-
       setOrders((prev) => [newOrder, ...prev]);
-      setLastParsedResult(result);
-      addSimLog(`[پردازش محلی] پیامک با موفقیت تفسیر شد: ${result.explanation}`);
-      
-      // Clear manual input
-      if (!overrideText) {
-        setSimMessageText("");
-      }
-    } catch (err: any) {
-      console.error(err);
-      setParsingError(err.message || "خطا در پردازش آفلاین پیام.");
-      addSimLog(`خطا در تفسیر: ${err.message || "خطای نامشخص"}`);
-    } finally {
-      setIsParsing(false);
+      addSimLog(`سفارش جدید برای ${contact.name} به مقدار ${orderFormQuantity} کیلوگرم ثبت شد.`);
     }
+
+    setOrderFormQuantity("");
+    setShowOrderFormModal(false);
   };
 
   // --- Orders Filtered by Active Delivery Date (Deduplicated, keeping latest per customer) ---
@@ -477,13 +502,14 @@ export default function App() {
     }, 0);
   }, [ordersWithDeliveryStatus]);
 
-  // --- Calculate remaining milk to deliver ---
+  // --- Calculate remaining milk in tank to deliver (Total ordered minus actually delivered) ---
   const remainingMilkQuantity = useMemo(() => {
-    return ordersWithDeliveryStatus.reduce((sum, order) => {
-      if (order.isCancelled || order.isDelivered) return sum;
+    const totalDelivered = ordersWithDeliveryStatus.reduce((sum, order) => {
+      if (order.isCancelled || !order.isDelivered) return sum;
       return sum + (order.deliveredQuantity || 0);
     }, 0);
-  }, [ordersWithDeliveryStatus]);
+    return Math.max(0, totalMilkQuantity - totalDelivered);
+  }, [ordersWithDeliveryStatus, totalMilkQuantity]);
 
   // --- Toggle Delivery Status ---
   const handleToggleDelivered = (order: any) => {
@@ -741,22 +767,37 @@ export default function App() {
     };
   }, [selectedDetailCustomer, orders]);
 
-  // --- Filtered History Tab List ---
-  const filteredHistoryOrders = useMemo(() => {
-    return orders.filter((order) => {
-      // Search match
-      const query = historySearch.trim().toLowerCase();
+  // --- Grouped History Ledger (Grouped by registration date of the order) ---
+  const historyGroupedByDate = useMemo(() => {
+    const query = historySearch.trim().toLowerCase();
+    const filtered = orders.filter((order) => {
+      if (!order.isMilkRequest) return false;
       const matchSearch =
         order.contactName.toLowerCase().includes(query) ||
-        order.messageText.toLowerCase().includes(query) ||
-        order.explanation.toLowerCase().includes(query) ||
-        order.contactPhone.includes(query);
+        order.contactPhone.includes(query) ||
+        (order.explanation && order.explanation.toLowerCase().includes(query));
 
-      // Customer filter
       const matchCustomer = selectedHistoryCustomer === "all" || order.contactId === selectedHistoryCustomer;
-
       return matchSearch && matchCustomer;
     });
+
+    const groups: Record<string, MilkOrder[]> = {};
+    for (const order of filtered) {
+      const regDate = new Date(order.receivedAt);
+      const dateKey = getStableDateKey(regDate);
+      if (!groups[dateKey]) {
+        groups[dateKey] = [];
+      }
+      groups[dateKey].push(order);
+    }
+
+    return Object.keys(groups)
+      .sort((a, b) => b.localeCompare(a))
+      .map((dateKey) => ({
+        dateKey,
+        orders: groups[dateKey].sort((a, b) => new Date(b.receivedAt).getTime() - new Date(a.receivedAt).getTime()),
+        totalQuantity: groups[dateKey].reduce((sum, o) => sum + (o.isCancelled ? 0 : o.milkQuantity || 0), 0),
+      }));
   }, [orders, historySearch, selectedHistoryCustomer]);
 
   return (
@@ -836,12 +877,20 @@ export default function App() {
                 </div>
                 <div className="flex gap-2">
                   <button
-                    onClick={() => setShowPasteSMSModal(true)}
-                    className="bg-slate-100 hover:bg-blue-50 hover:text-blue-600 text-slate-700 h-10 px-3.5 rounded-xl border border-slate-200 transition-all flex items-center gap-1.5 text-xs font-black active:scale-95 shadow-sm"
-                    title="ثبت دستی متن پیامک"
+                    onClick={() => {
+                      setOrderFormDateKey(getStableDateKey(activeDeliveryDate));
+                      if (customers.length > 0) {
+                        setOrderFormContactId(customers[0].id);
+                      } else {
+                        setOrderFormContactId("");
+                      }
+                      setShowOrderFormModal(true);
+                    }}
+                    className="bg-blue-600 hover:bg-blue-700 text-white h-10 px-3.5 rounded-xl transition-all flex items-center gap-1.5 text-xs font-black active:scale-95 shadow-sm"
+                    title="ثبت سفارش دستی جدید"
                   >
-                    <MessageSquare className="w-4 h-4 text-blue-600" />
-                    <span>ثبت پیامک</span>
+                    <Plus className="w-4 h-4 text-white" />
+                    <span>ثبت سفارش</span>
                   </button>
                   <button
                     onClick={() => setShowSettingsModal(true)}
@@ -918,30 +967,6 @@ export default function App() {
                       <h3 className="text-xs font-black text-slate-700">برنامه توزیع شیر {isViewingToday ? "امروز" : "فردا"}</h3>
                       <p className="text-[9px] text-slate-400">آخرین وضعیت سفارش هر مشتری ثابت</p>
                     </div>
-                    
-                    {/* View Mode Toggle */}
-                    <div className="bg-slate-100 p-0.5 rounded-lg flex items-center">
-                      <button
-                        onClick={() => setDashboardViewMode("list")}
-                        className={`px-2.5 py-1 rounded-md text-[9px] font-black transition-all ${
-                          dashboardViewMode === "list"
-                            ? "bg-white text-blue-700 shadow-xs"
-                            : "text-slate-500 hover:text-slate-800"
-                        }`}
-                      >
-                        لیست توزیع (خلاصه)
-                      </button>
-                      <button
-                        onClick={() => setDashboardViewMode("details")}
-                        className={`px-2.5 py-1 rounded-md text-[9px] font-black transition-all ${
-                          dashboardViewMode === "details"
-                            ? "bg-white text-blue-700 shadow-xs"
-                            : "text-slate-500 hover:text-slate-800"
-                        }`}
-                      >
-                        جزئیات پیامک‌ها
-                      </button>
-                    </div>
                   </div>
 
                   {ordersWithDeliveryStatus.length === 0 ? (
@@ -952,11 +977,11 @@ export default function App() {
                       <div className="space-y-1">
                         <p className="text-xs font-black text-slate-700">هیچ سفارشی ثبت نشده است</p>
                         <p className="text-[10px] text-slate-400 leading-relaxed max-w-xs mx-auto">
-                          برای این تاریخ هنوز پیامک تایید شده‌ای ثبت نشده است. از پانل سمت راست برای فرستادن پیامک تستی استفاده کنید.
+                          برای این تاریخ هنوز هیچ سفارشی ثبت نشده است. با کلیک بر روی دکمه ثبت سفارش در بالای صفحه، اولین سفارش را ثبت کنید.
                         </p>
                       </div>
                     </div>
-                  ) : dashboardViewMode === "list" ? (
+                  ) : (
                     /* HIGH DENSITY DISTRIBUTION MANIFEST LIST */
                     <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
                       <table className="w-full text-right text-[11px] border-collapse">
@@ -1042,113 +1067,6 @@ export default function App() {
                         </span>
                       </div>
                     </div>
-                  ) : (
-                    /* DETAILED CARDS VIEW WITH ORIGINAL SMS TEXT */
-                    <div className="space-y-2">
-                      {ordersWithDeliveryStatus.map((order) => (
-                        <div
-                          key={order.id}
-                          onClick={() => {
-                            const c = customers.find(x => x.id === order.contactId);
-                            if (c) setSelectedDetailCustomer(c);
-                          }}
-                          className={`p-3 bg-white rounded-2xl border transition-all hover:border-blue-300 shadow-xs cursor-pointer flex flex-col gap-2 relative group overflow-hidden ${
-                            order.isCancelled 
-                              ? "border-red-100 bg-red-50/20" 
-                              : order.isDelivered 
-                                ? "border-emerald-200 bg-emerald-50/5" 
-                                : "border-slate-200/80"
-                          }`}
-                        >
-                          {/* Cancel/Delivered indicator accent */}
-                          {order.isCancelled && (
-                            <div className="absolute top-0 right-0 h-full w-1 bg-red-500" />
-                          )}
-                          {!order.isCancelled && order.isDelivered && (
-                            <div className="absolute top-0 right-0 h-full w-1 bg-emerald-500" />
-                          )}
-                          {!order.isCancelled && !order.isDelivered && (
-                            <div className="absolute top-0 right-0 h-full w-1 bg-blue-500" />
-                          )}
-
-                          <div className="flex justify-between items-center">
-                            <div className="flex items-center gap-2">
-                              <div className={`w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs ${
-                                order.isCancelled 
-                                  ? "bg-red-100 text-red-700" 
-                                  : order.isDelivered
-                                    ? "bg-emerald-100 text-emerald-700"
-                                    : "bg-blue-100 text-blue-700"
-                              }`}>
-                                {order.contactName.substring(0, 2)}
-                              </div>
-                              <div>
-                                <h4 className="text-xs font-bold text-slate-800">{order.contactName}</h4>
-                                <span className="text-[9px] text-slate-400">{order.contactPhone}</span>
-                              </div>
-                            </div>
-
-                            <div className="text-left">
-                              {order.isCancelled ? (
-                                <span className="text-xs font-black text-red-600 bg-red-100 px-2 py-0.5 rounded-lg">لغو شده</span>
-                              ) : (
-                                <div className="flex flex-col items-end">
-                                  <span className={`text-sm font-black italic ${order.isDelivered ? "text-emerald-700" : "text-slate-900"}`}>
-                                    {order.deliveredQuantity} <span className="text-[10px] font-normal not-italic">کیلو</span>
-                                  </span>
-                                  {order.deliveredQuantity !== order.milkQuantity && (
-                                    <span className="text-[9px] text-slate-400 line-through">
-                                      سفارش: {order.milkQuantity} کیلو
-                                    </span>
-                                  )}
-                                </div>
-                              )}
-                              <span className="text-[9px] text-slate-400 block mt-0.5">
-                                {formatPersianTime(new Date(order.receivedAt))}
-                              </span>
-                            </div>
-                          </div>
-
-                          <div className="bg-slate-50/70 rounded-xl p-2 text-[10px] text-slate-500 border border-slate-100 space-y-1">
-                            <p className="line-clamp-1"><strong className="text-slate-600">پیامک:</strong> {order.messageText}</p>
-                            <p className="text-blue-600 font-bold flex items-center gap-1">
-                              <Sparkles className="w-3 h-3 text-blue-500" />
-                              <span>تفسیر: {order.explanation}</span>
-                            </p>
-                          </div>
-
-                          {/* Quick Delivery Actions inside detailed card */}
-                          <div className="flex justify-between items-center mt-1 pt-2 border-t border-slate-150" onClick={(e) => e.stopPropagation()}>
-                            <button
-                              type="button"
-                              onClick={() => handleToggleDelivered(order)}
-                              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-[10px] font-black transition-all ${
-                                order.isDelivered
-                                  ? "bg-emerald-500 border-emerald-500 text-white"
-                                  : "bg-slate-100 border-slate-200 text-slate-600 hover:bg-slate-200"
-                              }`}
-                            >
-                              <Check className="w-3.5 h-3.5" />
-                              <span>{order.isDelivered ? "تحویل شده" : "علامت تحویل"}</span>
-                            </button>
-
-                            {!order.isCancelled && (
-                              <div className="flex items-center gap-1.5">
-                                <span className="text-[10px] text-slate-400 font-bold">توزیع:</span>
-                                <input
-                                  type="number"
-                                  min="0"
-                                  value={order.deliveredQuantity}
-                                  onChange={(e) => handleUpdateDeliveredQuantity(order, Number(e.target.value))}
-                                  className="w-14 p-1 bg-slate-50 border border-slate-200 focus:border-blue-500 rounded-lg text-center font-bold text-xs"
-                                />
-                                <span className="text-[10px] text-slate-400">کیلو</span>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
                   )}
                 </div>
 
@@ -1169,8 +1087,11 @@ export default function App() {
             {/* 2. HISTORY VIEW */}
             {activeTab === "history" && (
               <div className="space-y-4 animate-fadeIn">
-                <div className="flex justify-between items-center">
-                  <h3 className="text-xs font-black text-slate-700">تاریخچه کامل پیام‌ها و تحلیل‌ها</h3>
+                <div className="flex justify-between items-center pb-1 border-b border-slate-200">
+                  <div>
+                    <h3 className="text-sm font-black text-slate-800">دفتر معین ثبت سفارشات</h3>
+                    <p className="text-[10px] text-slate-400">سوابق کلی تراکنش‌ها به تفکیک روز ثبت</p>
+                  </div>
                 </div>
 
                 {/* Filter and Search controls */}
@@ -1179,7 +1100,7 @@ export default function App() {
                     <Search className="w-4 h-4 text-slate-400 absolute right-3 top-1/2 -translate-y-1/2" />
                     <input
                       type="text"
-                      placeholder="جستجو در پیام‌ها یا مخاطب..."
+                      placeholder="جستجو در سوابق یا نام مشتری..."
                       value={historySearch}
                       onChange={(e) => setHistorySearch(e.target.value)}
                       className="w-full bg-slate-50 border border-slate-200 rounded-xl pr-9 pl-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-right"
@@ -1187,7 +1108,7 @@ export default function App() {
                   </div>
 
                   <div className="flex gap-2 items-center">
-                    <span className="text-[10px] font-bold text-slate-400 shrink-0">فیلتر مخاطب:</span>
+                    <span className="text-[10px] font-bold text-slate-400 shrink-0">فیلتر مشتری:</span>
                     <select
                       value={selectedHistoryCustomer}
                       onChange={(e) => setSelectedHistoryCustomer(e.target.value)}
@@ -1201,50 +1122,87 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Logs Timeline */}
-                <div className="space-y-2.5">
-                  {filteredHistoryOrders.length === 0 ? (
+                {/* Grouped Logs Timeline */}
+                <div className="space-y-4">
+                  {historyGroupedByDate.length === 0 ? (
                     <div className="bg-white rounded-2xl border border-slate-200 p-8 text-center text-xs text-slate-400">
-                      موردی یافت نشد.
+                      هیچ سابقه سفارشی یافت نشد.
                     </div>
                   ) : (
-                    filteredHistoryOrders.map((order) => (
-                      <div
-                        key={order.id}
-                        onClick={() => {
-                          const c = customers.find(x => x.id === order.contactId);
-                          if (c) setSelectedDetailCustomer(c);
-                        }}
-                        className="bg-white border border-slate-200 rounded-2xl p-3 shadow-xs space-y-2 hover:border-slate-300 transition-colors cursor-pointer"
-                      >
-                        <div className="flex justify-between items-center text-xs">
-                          <span className="font-bold text-slate-800">{order.contactName}</span>
-                          <span className="text-[9px] text-slate-400 font-mono">
-                            {formatPersianDateTime(new Date(order.receivedAt))}
-                          </span>
-                        </div>
+                    historyGroupedByDate.map((group) => {
+                      const groupDate = new Date(group.dateKey);
+                      return (
+                        <div key={group.dateKey} className="space-y-2">
+                          {/* Day Group Header Header */}
+                          <div className="flex justify-between items-center bg-slate-100 px-3 py-1.5 rounded-lg border border-slate-200/50 text-[10.5px] font-bold text-slate-600 shadow-3xs">
+                            <div className="flex items-center gap-1.5">
+                              <Calendar className="w-3.5 h-3.5 text-blue-500" />
+                              <span>روز ثبت: {formatPersianDateShort(groupDate)}</span>
+                            </div>
+                            <span className="bg-blue-50 text-blue-700 px-2 py-0.5 rounded-md font-black">
+                              جمع کل: {group.totalQuantity} کیلو
+                            </span>
+                          </div>
 
-                        <p className="text-slate-600 text-[10px] leading-relaxed bg-slate-50 p-2 rounded-xl font-mono text-right border border-slate-100">
-                          {order.messageText}
-                        </p>
+                          {/* Orders inside this group */}
+                          <div className="space-y-1.5">
+                            {group.orders.map((order) => {
+                              const deliveryDate = getDeliveryDateForOrderReceivedAt(
+                                new Date(order.receivedAt),
+                                settings.cutoffHour,
+                                settings.cutoffMinute
+                              );
+                              
+                              return (
+                                <div
+                                  key={order.id}
+                                  className="bg-white border border-slate-200/80 rounded-xl p-3 shadow-3xs flex justify-between items-center hover:border-blue-200 transition-colors"
+                                >
+                                  <div className="space-y-1">
+                                    <div className="flex items-center gap-2">
+                                      <span className="font-black text-xs text-slate-800">{order.contactName}</span>
+                                      <span className="text-[9px] text-slate-400 font-mono">({order.contactPhone})</span>
+                                    </div>
+                                    <div className="flex items-center gap-2 text-[9px] text-slate-500 font-medium">
+                                      <span>تاریخ تحویل: {formatPersianDateShort(deliveryDate)}</span>
+                                      <span>•</span>
+                                      <span className="font-mono text-[8px]">{formatPersianTime(new Date(order.receivedAt))}</span>
+                                    </div>
+                                  </div>
 
-                        <div className="flex justify-between items-center pt-1 border-t border-slate-100">
-                          <span className="text-[10px] text-blue-600 font-bold flex items-center gap-1.5">
-                            <Sparkles className="w-3.5 h-3.5 text-blue-500" />
-                            {order.explanation}
-                          </span>
-                          <span className={`text-[10px] font-black px-2 py-0.5 rounded-md ${
-                            order.isCancelled 
-                              ? "bg-red-50 text-red-700 border border-red-100" 
-                              : order.milkQuantity !== null 
-                                ? "bg-emerald-50 text-emerald-700 border border-emerald-100" 
-                                : "bg-slate-100 text-slate-600"
-                          }`}>
-                            {order.isCancelled ? "لغو" : order.milkQuantity !== null ? `${order.milkQuantity} کیلو` : "نامرتبط"}
-                          </span>
+                                  <div className="flex items-center gap-3">
+                                    <div className="text-left">
+                                      <span className={`text-xs font-black px-2 py-1 rounded-lg ${
+                                        order.isCancelled 
+                                          ? "bg-red-50 text-red-700 border border-red-100" 
+                                          : "bg-emerald-50 text-emerald-700 border border-emerald-100"
+                                      }`}>
+                                        {order.isCancelled ? "لغو شده" : `${order.milkQuantity} کیلو`}
+                                      </span>
+                                    </div>
+
+                                    {/* Action Edit button */}
+                                    <button
+                                      onClick={() => {
+                                        const dKey = getStableDateKey(deliveryDate);
+                                        setOrderFormContactId(order.contactId || "");
+                                        setOrderFormDateKey(dKey);
+                                        setOrderFormQuantity(order.milkQuantity || "");
+                                        setShowOrderFormModal(true);
+                                      }}
+                                      className="p-1.5 bg-slate-50 hover:bg-blue-50 text-slate-400 hover:text-blue-600 rounded-lg border border-slate-200/60 transition-colors"
+                                      title="ویرایش تراکنش"
+                                    >
+                                      <Edit2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
                         </div>
-                      </div>
-                    ))
+                      );
+                    })
                   )}
                 </div>
               </div>
@@ -1469,14 +1427,15 @@ export default function App() {
                 <div className="flex gap-2">
                   <button
                     onClick={() => {
-                      // Set template text to quickly mock sms for this contact
-                      setSelectedSimSender(selectedDetailCustomer.id);
-                      setSimMessageText("سلام برای فردا زحمت بکشید ۷۵ کیلو بفرستید");
+                      setOrderFormContactId(selectedDetailCustomer.id);
+                      setOrderFormDateKey(getStableDateKey(activeDeliveryDate));
+                      setOrderFormQuantity("");
+                      setShowOrderFormModal(true);
                       setSelectedDetailCustomer(null);
                     }}
                     className="flex-1 bg-blue-600 hover:bg-blue-700 text-white py-2.5 px-3 rounded-xl text-xs font-bold transition-colors text-center"
                   >
-                    شبیه‌سازی سفارش جدید
+                    ثبت سفارش جدید
                   </button>
                   <button
                     onClick={() => {
@@ -1492,17 +1451,19 @@ export default function App() {
             </div>
           )}
 
-          {/* Manual SMS Entry Modal Sheet */}
-          {showPasteSMSModal && (
+          {/* Manual Bookkeeper Order Entry Modal Sheet */}
+          {showOrderFormModal && (
             <div className="absolute inset-0 bg-black/40 z-50 flex flex-col justify-end animate-fadeIn">
               <div className="bg-white rounded-t-[30px] p-5 max-h-[85%] overflow-y-auto space-y-4 shadow-2xl border-t border-slate-200 transition-transform">
                 <div className="flex justify-between items-center border-b border-slate-100 pb-3">
                   <div className="flex items-center gap-2">
-                    <MessageSquare className="w-5 h-5 text-blue-600" />
-                    <h4 className="text-xs font-black text-slate-800">ثبت دستی متن پیامک</h4>
+                    <Plus className="w-5 h-5 text-blue-600" />
+                    <h4 className="text-xs font-black text-slate-800">
+                      {existingOrderForSelected ? "ویرایش و بروزرسانی سفارش" : "ثبت سفارش دستی جدید"}
+                    </h4>
                   </div>
                   <button
-                    onClick={() => setShowPasteSMSModal(false)}
+                    onClick={() => setShowOrderFormModal(false)}
                     className="p-1.5 hover:bg-slate-100 rounded-full text-slate-400 hover:text-slate-700 transition-colors"
                   >
                     <X className="w-5 h-5" />
@@ -1511,20 +1472,21 @@ export default function App() {
 
                 <div className="space-y-3.5 text-xs">
                   <div className="space-y-1">
-                    <label className="text-slate-500 block font-bold">انتخاب مشتری فرستنده:</label>
+                    <label className="text-slate-500 block font-bold">انتخاب مشتری:</label>
                     {customers.length === 0 ? (
                       <div className="text-[10px] text-red-600 bg-red-50 p-2.5 rounded-xl border border-red-100">
-                        هیچ مشتری ثابتی یافت نشد. ابتدا در بخش مشتریان دستی یا از دفترچه تلفن یکی اضافه کنید.
+                        هیچ مشتری ثابتی یافت نشد. ابتدا در بخش مشتریان یکی اضافه کنید.
                       </div>
                     ) : (
                       <select
-                        value={selectedSimSender}
-                        onChange={(e) => setSelectedSimSender(e.target.value)}
+                        value={orderFormContactId}
+                        onChange={(e) => setOrderFormContactId(e.target.value)}
                         className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-xs font-bold text-slate-800 focus:outline-none focus:ring-1 focus:ring-blue-500"
                       >
+                        <option value="">انتخاب کنید...</option>
                         {customers.map((c) => (
                           <option key={c.id} value={c.id}>
-                            {c.name} ({c.phone})
+                            {c.name}
                           </option>
                         ))}
                       </select>
@@ -1532,32 +1494,69 @@ export default function App() {
                   </div>
 
                   <div className="space-y-1">
-                    <label className="text-slate-500 block font-bold">متن کامل پیامک دریافت شده:</label>
-                    <textarea
-                      placeholder="مثال: سلام اکبر هستم فردا واسه ما زحمت بکشید ۴۵ کیلو شیر بفرستید دستت درد نکنه"
-                      value={simMessageText}
-                      onChange={(e) => setSimMessageText(e.target.value)}
-                      rows={4}
-                      className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500 leading-relaxed text-right"
+                    <label className="text-slate-500 block font-bold">تاریخ تحویل سفارش:</label>
+                    <select
+                      value={orderFormDateKey}
+                      onChange={(e) => setOrderFormDateKey(e.target.value)}
+                      className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-xs font-bold text-slate-700 focus:outline-none"
+                    >
+                      <option value={getStableDateKey(currentAppTime)}>
+                        توزیع امروز ({formatPersianDateShort(currentAppTime)})
+                      </option>
+                      <option value={getStableDateKey(new Date(currentAppTime.getTime() + 24 * 3600 * 1000))}>
+                        سفارش فردا ({
+                          (() => {
+                            const tm = new Date(currentAppTime);
+                            tm.setDate(tm.getDate() + 1);
+                            return formatPersianDateShort(tm);
+                          })()
+                        })
+                      </option>
+                    </select>
+                  </div>
+
+                  {/* Previous Order Info Box */}
+                  {orderFormContactId && (
+                    <div className="space-y-1">
+                      {lastOrderForForm ? (
+                        <div className="bg-slate-50 rounded-xl p-2.5 border border-slate-150 text-[10.5px] text-slate-500 font-bold space-y-1">
+                          <div className="flex justify-between">
+                            <span>مقدار سفارش قبلی این مشتری:</span>
+                            <span className="text-blue-700 font-black">{lastOrderForForm.milkQuantity} کیلوگرم</span>
+                          </div>
+                          <div className="flex justify-between text-[9px] text-slate-400 font-normal">
+                            <span>تاریخ ثبت سفارش قبلی:</span>
+                            <span>{formatPersianDateShort(new Date(lastOrderForForm.receivedAt))}</span>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="bg-slate-50 rounded-xl p-2 border border-slate-150 text-[10px] text-slate-400 italic text-center">
+                          هیچ سابقه سفارشی برای این مشتری یافت نشد.
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="space-y-1">
+                    <label className="text-slate-500 block font-bold">مقدار شیر درخواستی (کیلوگرم):</label>
+                    <input
+                      type="number"
+                      placeholder="مثال: ۱۲۰"
+                      value={orderFormQuantity}
+                      onChange={(e) => setOrderFormQuantity(e.target.value === "" ? "" : Number(e.target.value))}
+                      className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500 leading-relaxed text-right font-black"
                     />
                   </div>
 
                   <button
-                    onClick={async () => {
-                      if (customers.length === 0) {
-                        alert("لطفا ابتدا یک مشتری ثبت کنید.");
-                        return;
-                      }
-                      if (!simMessageText.trim()) {
-                        alert("متن پیامک نمی‌تواند خالی باشد.");
-                        return;
-                      }
-                      await handleSimulateSMS(simMessageText, selectedSimSender);
-                      setShowPasteSMSModal(false);
-                    }}
-                    className="w-full bg-blue-600 hover:bg-blue-700 text-white py-2.5 rounded-xl text-xs font-black transition-all shadow-md active:scale-95 flex items-center justify-center gap-1.5"
+                    onClick={handleSaveOrderForm}
+                    className={`w-full py-2.5 rounded-xl text-xs font-black transition-all shadow-md active:scale-95 flex items-center justify-center gap-1.5 ${
+                      existingOrderForSelected
+                        ? "bg-amber-500 hover:bg-amber-600 text-white"
+                        : "bg-blue-600 hover:bg-blue-700 text-white"
+                    }`}
                   >
-                    <span>پردازش و ثبت سفارش</span>
+                    <span>{existingOrderForSelected ? "بروزرسانی سفارش" : "ثبت سفارش"}</span>
                   </button>
                 </div>
               </div>
@@ -1666,7 +1665,7 @@ export default function App() {
         </div>
 
         {/* Android Home Navigation Pill Bar */}
-        <div className="absolute bottom-3 left-1/2 transform -translate-x-1/2 w-32 h-1 bg-slate-700 rounded-full"></div>
+        <div className="hidden lg:block absolute bottom-3 left-1/2 transform -translate-x-1/2 w-32 h-1 bg-slate-700 rounded-full"></div>
       </div>
 
     </div>
