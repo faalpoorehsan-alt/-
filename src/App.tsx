@@ -37,6 +37,7 @@ import {
   getStableDateKey,
   getDeliveryDateForOrderReceivedAt
 } from "./utils";
+import { parseMilkMessageLocally } from "./localParser";
 
 export default function App() {
   // --- Persistent States ---
@@ -57,18 +58,84 @@ export default function App() {
     return saved ? JSON.parse(saved) : { cutoffHour: 20, cutoffMinute: 0 };
   });
 
-  // Save to localStorage on change
+  const [isSyncing, setIsSyncing] = useState(false);
+
+  // Load from Server on Mount
+  useEffect(() => {
+    const fetchFromServer = async () => {
+      try {
+        const res = await fetch("/api/data");
+        if (res.ok) {
+          const data = await res.json();
+          if (data.customers) setCustomers(data.customers);
+          if (data.orders) setOrders(data.orders);
+          if (data.settings) setSettings(data.settings);
+        }
+      } catch (err) {
+        console.error("Failed to load server data:", err);
+      }
+    };
+    fetchFromServer();
+  }, []);
+
+  // Save to server & localStorage
+  const syncWithServer = async (updatedCusts?: Customer[], updatedOrders?: MilkOrder[], updatedSettings?: AppSettings) => {
+    try {
+      setIsSyncing(true);
+      await fetch("/api/save-state", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          customers: updatedCusts,
+          orders: updatedOrders,
+          settings: updatedSettings
+        })
+      });
+    } catch (err) {
+      console.error("Failed to sync with server:", err);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
   useEffect(() => {
     localStorage.setItem("milk_customers", JSON.stringify(customers));
+    syncWithServer(customers, undefined, undefined);
   }, [customers]);
 
   useEffect(() => {
     localStorage.setItem("milk_orders", JSON.stringify(orders));
+    syncWithServer(undefined, orders, undefined);
   }, [orders]);
 
   useEffect(() => {
     localStorage.setItem("milk_settings", JSON.stringify(settings));
+    syncWithServer(undefined, undefined, settings);
   }, [settings]);
+
+  // Polling for new background SMS orders every 5 seconds
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch("/api/data");
+        if (res.ok) {
+          const data = await res.json();
+          if (JSON.stringify(data.customers) !== JSON.stringify(customers)) {
+            setCustomers(data.customers);
+          }
+          if (JSON.stringify(data.orders) !== JSON.stringify(orders)) {
+            setOrders(data.orders);
+          }
+          if (JSON.stringify(data.settings) !== JSON.stringify(settings)) {
+            setSettings(data.settings);
+          }
+        }
+      } catch (err) {
+        console.error("Error polling database updates:", err);
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [customers, orders, settings]);
 
   // --- Simulated Clock for Testing ---
   const [useSimulatedClock, setUseSimulatedClock] = useState<boolean>(false);
@@ -143,7 +210,7 @@ export default function App() {
     setSimulationLogs((prev) => [`[${formatPersianTime(new Date())}] ${msg}`, ...prev.slice(0, 19)]);
   };
 
-  // --- API Call to Parse Order with Gemini ---
+  // --- 100% Offline Local Parser (No Server/API required) ---
   const handleSimulateSMS = async (overrideText?: string, overrideContactId?: string) => {
     const contactId = overrideContactId || selectedSimSender;
     const textToParse = overrideText || simMessageText;
@@ -162,49 +229,34 @@ export default function App() {
     setIsParsing(true);
     setParsingError(null);
     setLastParsedResult(null);
-    addSimLog(`شبیه‌سازی پیامک از ${contact.name}...`);
+    addSimLog(`در حال تفسیر آفلاین پیامک از ${contact.name}...`);
+
+    // Simulate a ultra-fast local processing latency of 150ms for elegant UI feedback
+    await new Promise((resolve) => setTimeout(resolve, 150));
 
     try {
-      const response = await fetch("/api/parse-order", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          text: textToParse,
-          contactName: contact.name,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error("خطا در پاسخ‌دهی سرور. وضعیت: " + response.status);
-      }
-
-      const result = await response.json();
+      const result = parseMilkMessageLocally(textToParse, contact.name);
       
-      // Determine delivery date:
-      // Orders received after the cutoff are generally processed next day.
-      // But standard Persian text "برای فردا" means the delivery date is 1 day after the message arrival.
       const now = new Date(currentAppTime);
       const deliveryDate = getDeliveryDateForOrderReceivedAt(now);
 
       const newOrder: MilkOrder = {
-        id: "order-" + Date.now(),
+        id: "order-" + Date.now() + Math.random().toString(36).substring(2, 5),
         contactId: contact.id,
         contactName: contact.name,
         contactPhone: contact.phone,
         messageText: textToParse,
         receivedAt: now.toISOString(),
         milkQuantity: result.milk_quantity,
-        isCancelled: !!result.is_cancelled,
-        isMilkRequest: !!result.is_milk_request,
-        explanation: result.explanation || "تفسیر خودکار",
+        isCancelled: result.is_cancelled,
+        isMilkRequest: result.is_milk_request,
+        explanation: result.explanation,
         parsedSuccessfully: true,
       };
 
       setOrders((prev) => [newOrder, ...prev]);
       setLastParsedResult(result);
-      addSimLog(`پیام با موفقیت تفسیر شد: ${result.explanation}`);
+      addSimLog(`[پردازش محلی] پیامک با موفقیت تفسیر شد: ${result.explanation}`);
       
       // Clear manual input
       if (!overrideText) {
@@ -212,7 +264,7 @@ export default function App() {
       }
     } catch (err: any) {
       console.error(err);
-      setParsingError(err.message || "برقراری ارتباط با سرور هوش مصنوعی ناموفق بود.");
+      setParsingError(err.message || "خطا در پردازش آفلاین پیام.");
       addSimLog(`خطا در تفسیر: ${err.message || "خطای نامشخص"}`);
     } finally {
       setIsParsing(false);
@@ -287,6 +339,51 @@ export default function App() {
       setSettings({ cutoffHour: 20, cutoffMinute: 0 });
       setUseSimulatedClock(false);
       addSimLog("کل سیستم به داده‌های نمونه اولیه ریست شد.");
+    }
+  };
+
+  // --- Import from native Android contacts via Contact Picker API ---
+  const handleImportFromAndroidContacts = async () => {
+    if ("contacts" in navigator && "select" in (navigator as any).contacts) {
+      try {
+        const props = ["name", "tel"];
+        const opts = { multiple: true };
+        const contactsList = await (navigator as any).contacts.select(props, opts);
+        
+        if (contactsList && contactsList.length > 0) {
+          const newCustomers: Customer[] = contactsList
+            .map((c: any) => {
+              const name = c.name && c.name[0] ? c.name[0] : "مخاطب جدید";
+              const phone = c.tel && c.tel[0] ? c.tel[0].replace(/\s+/g, "") : "";
+              return {
+                id: "cust-" + Date.now() + Math.random().toString(36).substr(2, 5),
+                name: name,
+                phone: phone,
+                alias: name.split(" ")[0] || name,
+                createdAt: new Date().toISOString(),
+              };
+            })
+            .filter((c: Customer) => c.phone !== "");
+
+          if (newCustomers.length > 0) {
+            setCustomers((prev) => {
+              const existingPhones = new Set(prev.map((item) => item.phone));
+              const filteredNew = newCustomers.filter((item) => !existingPhones.has(item.phone));
+              return [...prev, ...filteredNew];
+            });
+            addSimLog(`${newCustomers.length} مخاطب با موفقیت از دفترچه تلفن گوشی اندروید وارد شد.`);
+          } else {
+            alert("هیچ شماره تلفن معتبری در مخاطبین انتخاب شده یافت نشد.");
+          }
+        }
+      } catch (err: any) {
+        console.error(err);
+        addSimLog(`خطا در دسترسی به مخاطبین: ${err.message}`);
+      }
+    } else {
+      alert(
+        "این امکان فقط بر روی مرورگرهای اندروید (مانند Chrome یا Samsung Internet) پشتیبانی می‌شود.\n\nجهت استفاده، وب‌اپلیکیشن را طبق راهنما به صفحه اصلی اندروید اضافه کنید تا به عنوان برنامه محلی با ویژگی‌های کامل اجرا گردد."
+      );
     }
   };
 
@@ -547,7 +644,35 @@ export default function App() {
           <header className="bg-white border-b border-slate-200 p-4 shadow-sm shrink-0 flex flex-col gap-2.5">
             <div className="flex justify-between items-start">
               <div>
-                <h1 className="text-[10px] font-black text-slate-400 uppercase tracking-wider mb-0.5">گزارش سفارشات شیر</h1>
+                <div className="flex items-center gap-1.5 mb-0.5">
+                  <h1 className="text-[10px] font-black text-slate-400 uppercase tracking-wider">گزارش سفارشات شیر</h1>
+                  <button 
+                    onClick={async () => {
+                      setIsParsing(true);
+                      try {
+                        const res = await fetch("/api/data");
+                        if (res.ok) {
+                          const data = await res.json();
+                          setCustomers(data.customers);
+                          setOrders(data.orders);
+                          setSettings(data.settings);
+                          addSimLog("مجدداً از سرور مرکزی همگام‌سازی شد.");
+                        }
+                      } catch (e) {
+                        console.error(e);
+                      } finally {
+                        setIsParsing(false);
+                      }
+                    }}
+                    className="p-1 rounded-full text-slate-300 hover:text-blue-600 hover:bg-blue-50 transition-colors"
+                    title="بروزرسانی داده‌ها از سرور"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${isParsing ? "animate-spin text-blue-600" : ""}`} />
+                  </button>
+                  {isSyncing && (
+                    <span className="text-[8px] text-slate-400 font-bold bg-slate-100 px-1 py-0.5 rounded animate-pulse">همگام‌سازی...</span>
+                  )}
+                </div>
                 <p className="text-base font-black text-slate-800">
                   {formatPersianDateFull(activeDeliveryDate)}
                 </p>
@@ -598,6 +723,93 @@ export default function App() {
             {/* 1. DASHBOARD VIEW */}
             {activeTab === "dashboard" && (
               <div className="space-y-4 animate-fadeIn">
+                
+                {/* Mobile SMS Fast-Register Box */}
+                <div className="bg-slate-900 text-white rounded-2xl p-3.5 space-y-2.5 shadow-md">
+                  <div className="flex justify-between items-center">
+                    <span className="text-[10px] font-bold text-blue-400 flex items-center gap-1.5">
+                      <MessageSquare className="w-4 h-4 text-blue-500" />
+                      ثبت سریع متن پیامک کپی‌شده
+                    </span>
+                    <span className="text-[9px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-md font-mono">طرح اندروید</span>
+                  </div>
+                  <div className="space-y-2">
+                    <textarea
+                      placeholder="پیامک دریافتی از مشتری را در این کادر پیست (Paste) کنید..."
+                      value={simMessageText}
+                      onChange={(e) => setSimMessageText(e.target.value)}
+                      rows={2}
+                      className="w-full bg-slate-800 border border-slate-700 rounded-xl p-2.5 text-[11px] leading-relaxed text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 text-right resize-none"
+                    />
+                    <div className="flex gap-2">
+                      <select
+                        value={selectedSimSender}
+                        onChange={(e) => setSelectedSimSender(e.target.value)}
+                        className="bg-slate-800 border border-slate-700 rounded-xl text-[10px] px-2 py-2 font-bold text-slate-200 focus:outline-none flex-1"
+                      >
+                        {customers.map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.name}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        onClick={() => handleSimulateSMS()}
+                        disabled={isParsing || !simMessageText.trim() || customers.length === 0}
+                        className={`px-3 py-2 rounded-xl text-[10px] font-bold text-white flex items-center gap-1 transition-all ${
+                          isParsing || !simMessageText.trim()
+                            ? "bg-slate-800 text-slate-500 cursor-not-allowed"
+                            : "bg-blue-600 hover:bg-blue-700 active:scale-95"
+                        }`}
+                      >
+                        {isParsing ? "در حال تحلیل..." : "تفسیر و ثبت"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 100% Automatic SMS Webhook Integration Guide */}
+                <div className="bg-gradient-to-br from-indigo-50 to-blue-50 border border-blue-200/80 rounded-2xl p-3.5 space-y-2.5 shadow-sm animate-fadeIn">
+                  <div className="flex justify-between items-center">
+                    <span className="text-[11px] font-black text-indigo-900 flex items-center gap-1.5">
+                      <Sparkles className="w-4 h-4 text-indigo-600 animate-pulse" />
+                      اتوماسیون ۱۰۰٪ بدون دخالت دست (وب‌هوک)
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 bg-green-500 rounded-full animate-ping"></span>
+                      <span className="text-[9px] text-green-700 font-black">وب‌هوک پس‌زمینه فعال</span>
+                    </span>
+                  </div>
+                  
+                  <p className="text-[10px] leading-relaxed text-slate-600 text-right">
+                    برای اینکه وقتی <b>خواب هستید</b> یا برنامه بسته است، پیامک‌های مشتری خودکار دریافت و تحلیل شوند، کافیست یک اپلیکیشن رایگان ارسال پیامک به وب‌هوک (مانند <span className="font-bold text-indigo-800">SMS to Webhook</span>) روی گوشی اندروید خود نصب کنید و این آدرس را در آن ست کنید:
+                  </p>
+
+                  <div className="bg-white border border-slate-200 rounded-xl p-2 flex items-center justify-between gap-2">
+                    <button
+                      onClick={() => {
+                        const url = window.location.origin + "/api/incoming-sms";
+                        navigator.clipboard.writeText(url);
+                        alert("آدرس وب‌هوک اختصاصی شما کپی شد:\n" + url);
+                      }}
+                      className="bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white px-2.5 py-1 rounded-lg text-[9px] font-black transition-all shrink-0"
+                    >
+                      کپی آدرس
+                    </button>
+                    <span className="text-[9.5px] font-mono text-slate-500 truncate text-left select-all flex-1" dir="ltr">
+                      {window.location.origin}/api/incoming-sms
+                    </span>
+                  </div>
+
+                  <div className="bg-white/40 rounded-xl p-2.5 space-y-1.5 text-[9px] text-slate-500">
+                    <p className="font-bold text-slate-700">مراحل راه‌اندازی سریع در ۲ دقیقه:</p>
+                    <ol className="list-decimal list-inside space-y-1 pr-1.5 leading-relaxed">
+                      <li>نصب برنامه رایگان <b>SMS to Webhook</b> یا <b>SMS Forwarder</b> از گوگل‌پلی روی گوشی.</li>
+                      <li>تعریف یک فیلتر ارسال جدید با قرار دادن آدرس وب‌هوک کپی‌شده در بالا و متد <b>POST (JSON)</b>.</li>
+                      <li><b>تمام!</b> پیامک‌های دریافتی گوشی شما در پس‌زمینه خودکار به این وب‌اپلیکیشن ارسال و توسط هوش مصنوعی ثبت و جمع‌بندی می‌شوند.</li>
+                    </ol>
+                  </div>
+                </div>
                 
                 {/* Active Deliveries List */}
                 <div className="space-y-2.5">
@@ -837,14 +1049,30 @@ export default function App() {
             {/* 3. CUSTOMERS VIEW */}
             {activeTab === "customers" && (
               <div className="space-y-4 animate-fadeIn">
-                <div className="flex justify-between items-center">
-                  <h3 className="text-xs font-black text-slate-700">لیست مشتریان ثابت</h3>
+                <div className="bg-slate-50 border border-slate-150 rounded-2xl p-3.5 space-y-2 text-[10.5px] leading-relaxed text-slate-600">
+                  <div className="flex items-center gap-1.5 text-blue-700 font-bold">
+                    <Smartphone className="w-4 h-4 shrink-0 text-blue-600" />
+                    <span>راهنمای نصب اندروید (PWA)</span>
+                  </div>
+                  <p>
+                    این برنامه به صورت یک <b>وب‌اپلیکیشن پیشرونده (PWA)</b> برای اندروید بهینه‌سازی شده است. کافیست در مرورگر <b>Chrome</b> گوشی خود دکمه <span className="font-bold">سه نقطه</span> بالا را لمس کرده و گزینه <b>«نصب برنامه» (Install App)</b> یا <b>«افزودن به صفحه اصلی» (Add to Home screen)</b> را بزنید تا با آیکون اختصاصی روی گوشی نصب شده و مستقیماً به امکانات سیستمی متصل گردد.
+                  </p>
+                </div>
+
+                <div className="flex gap-2">
                   <button
                     onClick={() => setShowAddCustomerModal(true)}
-                    className="bg-blue-600 hover:bg-blue-700 text-white px-2.5 py-1.5 rounded-xl text-[10px] font-bold flex items-center gap-1 transition-all"
+                    className="flex-1 bg-blue-600 hover:bg-blue-700 text-white px-2.5 py-2 rounded-xl text-[10px] font-black flex items-center justify-center gap-1 transition-all"
                   >
                     <Plus className="w-3.5 h-3.5" />
-                    <span>مشتری جدید</span>
+                    <span>افزودن دستی مشتری</span>
+                  </button>
+                  <button
+                    onClick={handleImportFromAndroidContacts}
+                    className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white px-2.5 py-2 rounded-xl text-[10px] font-black flex items-center justify-center gap-1 transition-all"
+                  >
+                    <Smartphone className="w-3.5 h-3.5" />
+                    <span>وارد کردن از مخاطبین گوشی</span>
                   </button>
                 </div>
 
